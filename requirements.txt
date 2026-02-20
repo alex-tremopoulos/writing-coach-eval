@@ -3,6 +3,8 @@ fsspec==2024.10.0
 fuzzywuzzy==0.18.0
 huggingface_hub==1.4.1
 Levenshtein==0.27.3
+openai==2.21.0
 pandas==3.0.1
 poetry==2.3.2
 pyarrow==15.0.0
+python-dotenv==1.2.1
