@@ -4,7 +4,8 @@ import pandas as pd
 
 def apply_baseline_patches(df: pd.DataFrame) -> pd.DataFrame:
     """Apply the same row modifications as modify_public_datasets.py."""
-    df.loc[39, "target"] = (
+    mask_39 = df["query"] == "Fix disfluencies in the sentence"
+    df.loc[mask_39, "target"] = (
         "In distributed systems, data consistency is often difficult to "
         "maintain because nodes communicate over an unreliable network, and "
         "messages can be delayed or lost. Many algorithms attempt to address "
@@ -17,7 +18,7 @@ def apply_baseline_patches(df: pd.DataFrame) -> pd.DataFrame:
         "tolerance and load balancing, that are not trivial to address in "
         "practice."
     )
-    df.loc[39, "input"] = (
+    df.loc[mask_39, "input"] = (
         "In distributed systems the consistency of data are often difficult "
         "to maintain because nodes communicates over unreliable network and "
         "messages can delayed or lost. Many algorithm tries to solve this by "
@@ -30,10 +31,11 @@ def apply_baseline_patches(df: pd.DataFrame) -> pd.DataFrame:
         "tolerance and load balancing, that is not trivial to address in "
         "practice."
     )
-    df.loc[39, "query"] = "Fix fluency in this text"
-    df.loc[39, "dataset"] = "ChatGPT5.2"
+    df.loc[mask_39, "query"] = "Fix fluency in this text"
+    df.loc[mask_39, "dataset"] = "ChatGPT5.2"
 
-    df.loc[44, "query"] = (
+    mask_44 = df["query"].str.startswith("Cool!")
+    df.loc[mask_44, "query"] = (
         "Are there any other existing methods for leveraging information "
         "in knowledge bases for task-specific language model fine-tuning?"
     )
