@@ -33,6 +33,8 @@ from openai import AzureOpenAI
 # Configuration
 # ---------------------------------------------------------------------------
 
+start_time = time.time()
+
 load_dotenv()  # reads .env from cwd (repo root)
 
 logging.basicConfig(
@@ -42,11 +44,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ORIGINAL_CSV = REPO_ROOT / "data" / "data_routes_original.csv"
-OUTPUT_EXPANDED = REPO_ROOT / "data" / "data_routes_expanded.csv"
-OUTPUT_SYNTHETIC = REPO_ROOT / "data" / "data_routes_synthetic.csv"
-CHECKPOINT_FILE = REPO_ROOT / "data" / ".synthesis_checkpoint.json"
+
+ORIGINAL_CSV = REPO_ROOT / os.getenv("ORIGINAL_CSV", "data/data_routes_processed.csv")
+OUTPUT_EXPANDED = REPO_ROOT / os.getenv("OUTPUT_EXPANDED", "data/data_routes_expanded.csv")
+OUTPUT_SYNTHETIC = REPO_ROOT / os.getenv("OUTPUT_SYNTHETIC", "data/data_routes_synthetic.csv")
+CHECKPOINT_FILE = REPO_ROOT / os.getenv("CHECKPOINT_FILE", "data/.synthesis_checkpoint.json")
 
 # CS-oriented row indices (0-based) in the original CSV
 CS_INDICES: list[int] = list(range(0, 22)) + list(range(26, 31)) + [40]
@@ -57,27 +61,42 @@ DOMAINS: list[str] = ["Physics", "Biochemistry", "Humanities and Social Sciences
 # Route descriptions (derived from orchestrator_prompts.py) used in prompts
 ROUTE_DESCRIPTIONS: dict[str, str] = {
     "RESEARCH": (
-        "The user wants the assistant to search for academic papers, explore "
-        "literature, or discover what is known on a topic.  Typical trigger "
-        "verbs: find, search, retrieve, list, explore, verify, validate."
+        "The user wants to find papers, explore literature, or discover what's known."
+        "The user asks to verify or validate claims against published evidence."
+        "The user asks what's missing or where the gaps are in their argument."
+        "The user asks for more papers', 'additional evidence' or 'latest research ."
+        "The query requires searching academic databases for new information."
+        "Trigger verbs: find, search, explore, verify, validate, check, discover, review, look up, what's known, is this supported, evidence for"
+
+        "**Intent mapping**:"
+        "- validate_claims: checking if claims are supported by evidence"
+        "- explore_literature: finding papers on a topic"
+        "- identify_gaps: finding what's missing in the argument"
     ),
     "RESPOND": (
-        "The user wants the assistant to summarise, compare, analyse, or "
-        "discuss information already provided in the conversation.  They are "
-        "NOT requesting new research or text edits.  Typical trigger verbs: "
-        "summarise, compare, explain, what do you think, is this reasonable."
+        "The user wants to summarise, compare, or analyse information already provided in the conversation."
+        "The user asks to reformat or reorganise findings from previous turns."
+        "The user references specific earlier turns or findings without requesting new research or text edits."
+        "The user asks general questions about their document or approach."
+        "The user makes meta-commentary ('What do you think?', 'Is this approach reasonable?')."
+        "The user asks about the assistant's capabilities or how to use it."
+        "The message is a follow-up question about previously found papers that doesn't require new search."
+        "Examples: 'Summarise what you found', 'Compare those papers', 'What do you think?', 'Is this approach reasonable?'"
+        "Trigger verbs: summarise, compare, explain, what did you mean, create a table from, organise, recap, what do you think, is this, how should I"
     ),
     "REVISE_RESEARCH": (
-        "The user asks to improve, strengthen, or enhance existing text AND "
-        "the revision requires finding new external evidence.  Typical "
-        "trigger verbs: strengthen with evidence, add citations, add sources, "
-        "provide more evidence, add a definition."
+        "The user asks to improve, strengthen, or enhance text and no prior research is available."
+        "The user asks to add citations, evidence, or sources to text."
+        "The user gives vague revision commands ('improve this', 'make it better', 'strengthen this') without prior relevant research in the conversation."
+        "The revision would benefit from new external evidence."
+        "Trigger verbs: strengthen with evidence, add citations, add sources, make more convincing, improve argument"
     ),
     "REVISE_SIMPLE": (
-        "The user asks for mechanical text changes that do NOT require new "
-        "research: grammar, spelling, paraphrasing, reformatting, tone "
-        "changes, making text concise, etc.  Typical trigger verbs: fix "
-        "grammar, simplify, shorten, rephrase, reformat, paraphrase."
+        "The user asks for mechanical text changes: grammar, spelling, punctuation, formatting."
+        "The user asks to rephrase, simplify, shorten, change tone, or restructure without new evidence."
+        "The user asks to convert to bullets, make concise, use active voice, remove jargon."
+        "The user asks to apply findings from a PREVIOUS conversation turn to the text (e.g., 'revise based on what you found', 'apply that feedback' , 'use those papers to improve this')."
+        "Trigger verbs: fix grammar, simplify, shorten, rephrase, reformat, make concise, change tone, convert to bullets, apply, use those findings"
     ),
 }
 
@@ -99,6 +118,15 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-51-chat")
 API_CALL_DELAY = 1.5
 # Max retries on transient failures
 MAX_RETRIES = 5
+
+# Cost tracking (Azure GPT-5.1-chat pricing, per 1M tokens)
+INPUT_PRICE_PER_1M  = float(os.getenv("INPUT_PRICE_PER_1M",  "1.25"))
+OUTPUT_PRICE_PER_1M = float(os.getenv("OUTPUT_PRICE_PER_1M", "10.00"))
+MAX_BUDGET_USD      = float(os.getenv("MAX_BUDGET_USD",       "10.0"))
+DRY_RUN             = os.getenv("DRY_RUN", "false").lower() == "true"
+
+_total_input_tokens:  int = 0
+_total_output_tokens: int = 0
 
 # ---------------------------------------------------------------------------
 # Azure OpenAI client
@@ -166,21 +194,38 @@ an "input" (the text the user is currently working on).
 Route for ALL examples: {route}
 Route meaning: {route_desc}
 
+*** HARD REQUIREMENT — INPUT LENGTH ***
+Every "input" field MUST contain at least 700 characters.  Most inputs \
+should be 1000–1800 characters.  Distribute the {count} examples roughly \
+equally: ~1/3 at 700–1000 chars, ~1/3 at 1000–1500 chars, ~1/3 at 1500+ \
+chars.  Short inputs (under 700 chars) are INVALID and should be rejected. \
+The few-shot examples below may be short — ignore their length if it is short \
+and always produce substantially longer texts.
+
 Rules:
 1. Every query MUST unambiguously trigger the route "{route}" according to \
    these routing rules.  Use the appropriate trigger verbs and phrasing.
-2. Topics must be diverse — spread across different domains such as cooking, \
-   travel, sports, medicine, environmental science, architecture, psychology, \
-   law, marine biology, nutrition, climate policy, music, personal finance, \
-   engineering, agriculture, etc.  Topics CAN be scientific, but must NOT \
-   be specifically about Computer Science, Physics, Biochemistry, or \
-   Humanities & Social Sciences.
+2. Topics must be diverse — spread across different domains such as medicine, \
+   environmental science, architecture, psychology, law, marine biology, \
+   nutrition, climate policy, personal finance, engineering, agriculture, etc. \
+   Topics CAN be scientific, but must NOT be specifically about Computer \
+   Science, Physics, Biochemistry, or Humanities & Social Sciences.
 3. Do NOT include citation markers like [0], [1], [2].
-4. Vary input length: some short (50-200 chars), some medium (200-600 chars), \
-   some long (600+ chars).
-5. Queries should be similar in style and brevity to these examples:
+4. If the route involves revising or editing text (e.g. REVISE_SIMPLE, \
+   REVISE_RESEARCH), the input text MUST already contain the specific \
+   problems the query asks to fix.  Examples: \
+   - query asks to fix grammar → input must contain grammatical errors; \
+   - query asks to simplify → input must use unnecessarily complex language; \
+   - query asks to shorten → input must be verbose and repetitive; \
+   - query asks to fix tone → input must have an inappropriate tone; \
+   - query asks to convert to bullets → input must be dense prose. \
+   A query that asks to "fix X" is incoherent if the input has no X to fix — \
+   always ensure the intent is grounded in the input.
+5. Before finalising each example, mentally count the characters in the \
+   "input" field.  If it is under 700 characters, expand it before returning.
+6. Queries should be similar in style and brevity to these examples:
 {examples}
-6. Return ONLY a valid JSON array of objects: \
+7. Return ONLY a valid JSON array of objects: \
    [{{"query": "...", "input": "..."}}, ...]
 """
 
@@ -194,6 +239,12 @@ def call_llm(
     client: AzureOpenAI, system: str, user: str, *, temperature: float = 0.9
 ) -> str:
     """Call Azure OpenAI with retry logic.  Returns raw content string."""
+    global _total_input_tokens, _total_output_tokens
+
+    if DRY_RUN:
+        log.info("[DRY RUN] Skipping API call")
+        return '{"query": "DRY_RUN_QUERY", "input": "DRY_RUN_INPUT"}'
+    
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.chat.completions.create(
@@ -205,7 +256,31 @@ def call_llm(
                 temperature=temperature,
                 max_tokens=4096,
             )
+            
+                        # Track usage and enforce budget
+            usage = resp.usage
+            if usage:
+                _total_input_tokens  += usage.prompt_tokens
+                _total_output_tokens += usage.completion_tokens
+                cost = (
+                    _total_input_tokens  / 1_000_000 * INPUT_PRICE_PER_1M
+                    + _total_output_tokens / 1_000_000 * OUTPUT_PRICE_PER_1M
+                )
+                log.info(
+                    "Cumulative cost: $%.4f  (in=%d, out=%d tokens)",
+                    cost, _total_input_tokens, _total_output_tokens,
+                )
+                if cost > MAX_BUDGET_USD:
+                    raise RuntimeError(
+                        f"Budget cap of ${MAX_BUDGET_USD:.2f} exceeded "
+                        f"(current: ${cost:.4f}). "
+                        "Raise MAX_BUDGET_USD env var to continue."
+                    )
+
             return resp.choices[0].message.content.strip()
+
+        except RuntimeError:
+            raise  # never retry a budget error
         except Exception as exc:
             wait = 2**attempt
             log.warning(
@@ -352,7 +427,7 @@ def _get_generic_exemplars(df: pd.DataFrame, route: str) -> str:
     lines = []
     for _, r in subset.iterrows():
         lines.append(f'  query: "{r["query"]}"')
-        inp = str(r["input"])[:200]
+        inp = str(r["input"])[:2000]
         lines.append(f'  input (preview): "{inp}…"')
         lines.append("")
     return "\n".join(lines)
@@ -405,15 +480,27 @@ def generate_generic_rows(client: AzureOpenAI, df: pd.DataFrame) -> list[dict]:
                 f'"{route}".  Return ONLY a JSON array.'
             )
 
-            raw = call_llm(client, sys_prompt, usr_prompt)
-            try:
-                parsed = parse_json(raw)
-                if not isinstance(parsed, list):
-                    parsed = [parsed]
-            except json.JSONDecodeError as exc:
-                log.error("Failed to parse generic batch: %s\nRaw:\n%s", exc, raw[:500])
-                time.sleep(API_CALL_DELAY)
-                continue  # retry this sub-batch implicitly on next iteration
+            MAX_BATCH_RETRIES = 3
+            parsed = []
+            for batch_attempt in range(1, MAX_BATCH_RETRIES + 1):
+                raw = call_llm(client, sys_prompt, usr_prompt)
+                try:
+                    parsed = parse_json(raw)
+                    if not isinstance(parsed, list):
+                        parsed = [parsed]
+                    break  # success — exit retry loop
+                except json.JSONDecodeError as exc:
+                    log.error(
+                        "Failed to parse generic batch (attempt %d/%d): %s\nRaw:\n%s",
+                        batch_attempt, MAX_BATCH_RETRIES, exc, raw[:500],
+                    )
+                    if batch_attempt < MAX_BATCH_RETRIES:
+                        time.sleep(API_CALL_DELAY)
+                    else:
+                        log.error(
+                            "Skipping sub-batch after %d failed parse attempts",
+                            MAX_BATCH_RETRIES,
+                        )
 
             for item in parsed[:batch_count]:
                 record = {
@@ -450,7 +537,7 @@ def validate_rows(rows: list[dict], label: str) -> None:
         if not r.get("input"):
             log.warning("%s: empty input", tag)
             issues += 1
-        if len(r.get("input", "")) < 30:
+        if len(r.get("input", "")) < 100:
             log.warning("%s: very short input (%d chars)", tag, len(r.get("input", "")))
             issues += 1
         # Check for leftover citation markers
@@ -465,49 +552,9 @@ def validate_rows(rows: list[dict], label: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-
-def apply_baseline_patches(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply the same row modifications as modify_public_datasets.py."""
-    df.loc[39, "target"] = (
-        "In distributed systems, data consistency is often difficult to "
-        "maintain because nodes communicate over an unreliable network, and "
-        "messages can be delayed or lost. Many algorithms attempt to address "
-        "this by introducing consensus protocols such as Paxos or Raft, which "
-        "ensure that all replicas agree on the same value even if some of them "
-        "fail. However, implementing these protocols is complex and requires "
-        "careful reasoning about concurrency, since race conditions and "
-        "deadlocks can easily occur. Furthermore, scaling the system "
-        "horizontally introduces additional challenges, such as partition "
-        "tolerance and load balancing, that are not trivial to address in "
-        "practice."
-    )
-    df.loc[39, "input"] = (
-        "In distributed systems the consistency of data are often difficult "
-        "to maintain because nodes communicates over unreliable network and "
-        "messages can delayed or lost. Many algorithm tries to solve this by "
-        "introducing consensus protocols such as Paxos or Raft, which ensures "
-        "that all replicas agree on a same value even if some of them fails. "
-        "However, the implementation of these protocols is complex and "
-        "requires careful reasoning about concurrency, since race condition "
-        "and deadlocks can easily occurs. Furthermore, scaling the system "
-        "horizontally introduce additional challenges, like partition "
-        "tolerance and load balancing, that is not trivial to address in "
-        "practice."
-    )
-    df.loc[39, "query"] = "Fix fluency in this text"
-    df.loc[39, "dataset"] = "ChatGPT5.2"
-
-    df.loc[44, "query"] = (
-        "Are there any other existing methods for leveraging information "
-        "in knowledge bases for task-specific language model fine-tuning?"
-    )
-    return df
-
-
 def main() -> None:
     log.info("Loading original CSV from %s", ORIGINAL_CSV)
     df = pd.read_csv(ORIGINAL_CSV)
-    df = apply_baseline_patches(df)
     log.info("Original dataset: %d rows", len(df))
     log.info("Route distribution:\n%s", df["route"].value_counts().to_string())
 
@@ -570,6 +617,8 @@ def main() -> None:
 
     log.info("Done!  %d original + %d synthetic = %d total rows",
              len(df), len(synthetic_df), len(merged_df))
+    
+    print("--- %s Seconds passed to run the script---" % (time.time() - start_time))  #17.5 mins
 
 
 if __name__ == "__main__":
