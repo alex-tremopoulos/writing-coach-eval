@@ -1,4 +1,6 @@
 /data
 .venv
-orchestrator_prompts.py
 .env
+/src/wc_src
+/extras
+src/__pycache__
