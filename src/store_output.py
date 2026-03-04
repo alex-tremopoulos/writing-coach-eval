@@ -245,6 +245,20 @@ def process_csv(
     completed = len(processed_ids)
     total = len(rows_to_run)
 
+    # Warm up with dummy query to consume cold start (first row CONVERSATION fallback)
+    print("\n" + "=" * 80)
+    print("WARMUP: Running dummy query to initialize graph and consume cold start...")
+    try:
+        dummy_result = run_query(
+            row_id=0,
+            query="What is machine learning?",
+            document_text="Machine learning is a subset of artificial intelligence that focuses on developing algorithms and statistical models that enable computer systems to improve their performance on tasks through experience, without being explicitly programmed."
+        )
+        print(f"  Dummy query completed - route: {dummy_result['route']}")
+    except Exception as e:
+        print(f"  Dummy query failed (continuing anyway): {e}")
+    print("=" * 80 + "\n")
+
     try:
         for idx, (row_id, row) in enumerate(rows_to_run):
             if row_id in processed_ids:
@@ -263,21 +277,26 @@ def process_csv(
             try:
                 result = run_query(row_id, query, document_text)
             except Exception as e:
-                print(f"  ERROR: {e}")
-                result = {
-                    'row_id': row_id,
-                    'query': query,
-                    'input_preview': document_text[:200],
-                    'route': 'ERROR',
-                    'intent': 'error',
-                    'reasoning': str(e),
-                    'response': '',
-                    'suggestions': [],
-                    'references': [],
-                    'research_papers': [],
-                    'segments_count': 0,
-                    'tools_used': [],
-                }
+                if row_id == 1 and "orchestrator failed" in str(e):
+                    # Retry first row once (cold start recovery)
+                    time.sleep(2)
+                    result = run_query(row_id, query, document_text)
+                else:
+                    print(f"  ERROR: {e}")
+                    result = {
+                        'row_id': row_id,
+                        'query': query,
+                        'input_preview': document_text[:200],
+                        'route': 'ERROR',
+                        'intent': 'error',
+                        'reasoning': str(e),
+                        'response': '',
+                        'suggestions': [],
+                        'references': [],
+                        'research_papers': [],
+                        'segments_count': 0,
+                        'tools_used': [],
+                    }
 
             # Write immediately — flush to disk so no progress is lost on crash
             _write_csv_row(csv_writer, result)
@@ -290,6 +309,10 @@ def process_csv(
                   f"Papers: {len(result['research_papers'])} | "
                   f"Response: {len(result['response'])} chars "
                   f"[{completed}/{total} done]")
+
+            if idx == 0:  # First row just completed
+                print("  Warming up connections for 5s...")
+                time.sleep(5)
 
             # Delay between rows to avoid HTTP 429 rate limit errors
             if idx < total - 1:
