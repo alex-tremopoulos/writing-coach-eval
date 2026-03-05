@@ -193,6 +193,8 @@ def process_csv(
     input_csv: str,
     output_dir: str = 'batch_outputs',
     filter_route: Optional[str] = None,
+    results_csv_override: Optional[str] = None,
+    details_jsonl_override: Optional[str] = None,
 ) -> None:
     """Process rows in CSV, writing results incrementally after each row.
 
@@ -208,10 +210,22 @@ def process_csv(
     output_path.mkdir(exist_ok=True)
 
     # Fixed filenames based on input stem so resume works across restarts
-    stem = Path(input_csv).stem
-    route_suffix = f'_{filter_route.upper()}' if filter_route else ''
-    results_csv  = output_path / f'{stem}{route_suffix}_results.csv'
-    details_jsonl = output_path / f'{stem}{route_suffix}_details.jsonl'
+    # Allow caller to override output paths (e.g. to append into an existing file)
+    if results_csv_override:
+        results_csv = Path(results_csv_override)
+        results_csv.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        stem = Path(input_csv).stem
+        route_suffix = f'_{filter_route.upper()}' if filter_route else ''
+        results_csv = output_path / f'{stem}{route_suffix}_results.csv'
+
+    if details_jsonl_override:
+        details_jsonl = Path(details_jsonl_override)
+        details_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        stem = Path(input_csv).stem
+        route_suffix = f'_{filter_route.upper()}' if filter_route else ''
+        details_jsonl = output_path / f'{stem}{route_suffix}_details.jsonl'
 
     # Resume: skip rows already in the JSONL output
     processed_ids = _already_processed(details_jsonl)
@@ -371,7 +385,17 @@ if __name__ == "__main__":
     parser.add_argument('input_csv', help='Path to input CSV with query and input columns')
     parser.add_argument('--output', default='batch_outputs', help='Output directory (default: batch_outputs)')
     parser.add_argument('--route', default=None, help='Only process rows matching this route value (e.g. RESEARCH, RESPOND)')
+    parser.add_argument('--results-csv', default=None, dest='results_csv',
+                        help='Override output CSV path (useful for appending into an existing file)')
+    parser.add_argument('--details-jsonl', default=None, dest='details_jsonl',
+                        help='Override output JSONL path (useful for appending into an existing file)')
 
     args = parser.parse_args()
 
-    process_csv(args.input_csv, args.output, filter_route=args.route)
+    process_csv(
+        args.input_csv,
+        args.output,
+        filter_route=args.route,
+        results_csv_override=args.results_csv,
+        details_jsonl_override=args.details_jsonl,
+    )
