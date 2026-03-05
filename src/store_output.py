@@ -135,6 +135,7 @@ def run_query(row_id: int, query: str, document_text: str) -> Dict[str, Any]:
         'row_id': row_id,
         'query': query,
         'input_preview': document_text[:200] + '...' if len(document_text) > 200 else document_text,
+        'input': document_text,
         'route': route,
         'intent': intent,
         'reasoning': reasoning,
@@ -148,7 +149,7 @@ def run_query(row_id: int, query: str, document_text: str) -> Dict[str, Any]:
 
 
 CSV_FIELDNAMES = [
-    'row_id', 'query', 'input_preview', 'route', 'intent', 'reasoning',
+    'row_id', 'query', 'input_preview', 'input_text', 'route', 'intent', 'reasoning',
     'response_length', 'suggestions_count', 'references_count',
     'papers_count', 'segments_count', 'tools_used'
 ]
@@ -177,6 +178,7 @@ def _write_csv_row(csv_writer, result: Dict[str, Any]) -> None:
         'row_id': result['row_id'],
         'query': result['query'],
         'input_preview': result['input_preview'],
+        'input': result.get('input', ''),
         'route': result['route'],
         'intent': result['intent'],
         'reasoning': result['reasoning'],
@@ -301,6 +303,7 @@ def process_csv(
                         'row_id': row_id,
                         'query': query,
                         'input_preview': document_text[:200],
+                        'input': document_text,
                         'route': 'ERROR',
                         'intent': 'error',
                         'reasoning': str(e),
