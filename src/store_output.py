@@ -234,7 +234,7 @@ def process_csv(
     if processed_ids:
         print(f"Resuming — {len(processed_ids)} rows already processed, skipping them.")
 
-    with open(input_csv, 'r', encoding='utf-8') as f:
+    with open(input_csv, 'r', encoding='utf-8-sig') as f:
         rows = list(csv.DictReader(f))
 
     # Apply route filter if requested
