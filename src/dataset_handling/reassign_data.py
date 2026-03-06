@@ -257,6 +257,9 @@ def main() -> None:
 
     # ---- 3. Normalise input column (new21 uses 'input_text') ---------------
     if "input_text" in combined.columns:
+        # Ensure 'input' exists before combining; some sources may only have 'input_text'
+        if "input" not in combined.columns:
+            combined["input"] = pd.NA
         combined["input"] = combined["input"].combine_first(combined["input_text"])
         combined.drop(columns=["input_text"], inplace=True)
 
