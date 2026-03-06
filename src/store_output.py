@@ -135,6 +135,7 @@ def run_query(row_id: int, query: str, document_text: str) -> Dict[str, Any]:
         'row_id': row_id,
         'query': query,
         'input_preview': document_text[:200] + '...' if len(document_text) > 200 else document_text,
+        'input': document_text,
         'route': route,
         'intent': intent,
         'reasoning': reasoning,
@@ -148,7 +149,7 @@ def run_query(row_id: int, query: str, document_text: str) -> Dict[str, Any]:
 
 
 CSV_FIELDNAMES = [
-    'row_id', 'query', 'input_preview', 'route', 'intent', 'reasoning',
+    'row_id', 'query', 'input_preview', 'input_text', 'route', 'intent', 'reasoning',
     'response_length', 'suggestions_count', 'references_count',
     'papers_count', 'segments_count', 'tools_used'
 ]
@@ -177,6 +178,7 @@ def _write_csv_row(csv_writer, result: Dict[str, Any]) -> None:
         'row_id': result['row_id'],
         'query': result['query'],
         'input_preview': result['input_preview'],
+        'input': result.get('input', ''),
         'route': result['route'],
         'intent': result['intent'],
         'reasoning': result['reasoning'],
@@ -193,6 +195,8 @@ def process_csv(
     input_csv: str,
     output_dir: str = 'batch_outputs',
     filter_route: Optional[str] = None,
+    results_csv_override: Optional[str] = None,
+    details_jsonl_override: Optional[str] = None,
 ) -> None:
     """Process rows in CSV, writing results incrementally after each row.
 
@@ -208,17 +212,27 @@ def process_csv(
     output_path.mkdir(exist_ok=True)
 
     # Fixed filenames based on input stem so resume works across restarts
+    # Allow caller to override output paths (e.g. to append into an existing file)
     stem = Path(input_csv).stem
     route_suffix = f'_{filter_route.upper()}' if filter_route else ''
-    results_csv  = output_path / f'{stem}{route_suffix}_results.csv'
-    details_jsonl = output_path / f'{stem}{route_suffix}_details.jsonl'
+    if results_csv_override:
+        results_csv = Path(results_csv_override)
+        results_csv.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        results_csv = output_path / f'{stem}{route_suffix}_results.csv'
+
+    if details_jsonl_override:
+        details_jsonl = Path(details_jsonl_override)
+        details_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        details_jsonl = output_path / f'{stem}{route_suffix}_details.jsonl'
 
     # Resume: skip rows already in the JSONL output
     processed_ids = _already_processed(details_jsonl)
     if processed_ids:
         print(f"Resuming — {len(processed_ids)} rows already processed, skipping them.")
 
-    with open(input_csv, 'r', encoding='utf-8') as f:
+    with open(input_csv, 'r', encoding='utf-8-sig') as f:
         rows = list(csv.DictReader(f))
 
     # Apply route filter if requested
@@ -287,6 +301,7 @@ def process_csv(
                         'row_id': row_id,
                         'query': query,
                         'input_preview': document_text[:200],
+                        'input': document_text,
                         'route': 'ERROR',
                         'intent': 'error',
                         'reasoning': str(e),
@@ -371,7 +386,17 @@ if __name__ == "__main__":
     parser.add_argument('input_csv', help='Path to input CSV with query and input columns')
     parser.add_argument('--output', default='batch_outputs', help='Output directory (default: batch_outputs)')
     parser.add_argument('--route', default=None, help='Only process rows matching this route value (e.g. RESEARCH, RESPOND)')
+    parser.add_argument('--results-csv', default=None, dest='results_csv',
+                        help='Override output CSV path (useful for appending into an existing file)')
+    parser.add_argument('--details-jsonl', default=None, dest='details_jsonl',
+                        help='Override output JSONL path (useful for appending into an existing file)')
 
     args = parser.parse_args()
 
-    process_csv(args.input_csv, args.output, filter_route=args.route)
+    process_csv(
+        args.input_csv,
+        args.output,
+        filter_route=args.route,
+        results_csv_override=args.results_csv,
+        details_jsonl_override=args.details_jsonl,
+    )
