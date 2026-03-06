@@ -24,8 +24,8 @@ Variance constraint:
     from a DIFFERENT intent family (no repeated intent for the same example)
 
 Usage:
-    python scripts/generate_eval_dataset.py
-    python scripts/generate_eval_dataset.py --output data_outputs/eval/wc2_eval_21.csv
+    python src/dataset_handling/generate_eval_dataset.py
+    python src/dataset_handling/generate_eval_dataset.py --output data_outputs/eval/wc2_eval_21.csv
 """
 
 import argparse
