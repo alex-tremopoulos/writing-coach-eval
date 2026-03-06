@@ -207,6 +207,12 @@ def process_csv(
         output_dir: Directory for output files.
         filter_route: If set, only process rows whose 'route' column matches this value
                       (case-insensitive). Pass None to process all rows.
+        results_csv_override: If set, write the results CSV to this path instead of the
+                              default ``<output_dir>/<stem>[_<ROUTE>]_results.csv``.
+                              Parent directories are created automatically.
+        details_jsonl_override: If set, write the details JSONL to this path instead of
+                                the default ``<output_dir>/<stem>[_<ROUTE>]_details.jsonl``.
+                                Parent directories are created automatically.
     """
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
