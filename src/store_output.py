@@ -213,20 +213,18 @@ def process_csv(
 
     # Fixed filenames based on input stem so resume works across restarts
     # Allow caller to override output paths (e.g. to append into an existing file)
+    stem = Path(input_csv).stem
+    route_suffix = f'_{filter_route.upper()}' if filter_route else ''
     if results_csv_override:
         results_csv = Path(results_csv_override)
         results_csv.parent.mkdir(parents=True, exist_ok=True)
     else:
-        stem = Path(input_csv).stem
-        route_suffix = f'_{filter_route.upper()}' if filter_route else ''
         results_csv = output_path / f'{stem}{route_suffix}_results.csv'
 
     if details_jsonl_override:
         details_jsonl = Path(details_jsonl_override)
         details_jsonl.parent.mkdir(parents=True, exist_ok=True)
     else:
-        stem = Path(input_csv).stem
-        route_suffix = f'_{filter_route.upper()}' if filter_route else ''
         details_jsonl = output_path / f'{stem}{route_suffix}_details.jsonl'
 
     # Resume: skip rows already in the JSONL output
