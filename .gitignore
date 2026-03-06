@@ -3,6 +3,5 @@
 .env
 /src/wc_src
 /extras
-src/__pycache__
+**/__pycache__
 /data_outputs
-src/app_wc_src/__pycache__
