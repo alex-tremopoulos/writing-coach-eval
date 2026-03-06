@@ -103,18 +103,6 @@ def read_csv_files(folder: Path) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def read_jsonl_files(folder: Path) -> list[dict]:
-    records = []
-    for jsonl_file in sorted(f for f in folder.glob("*.jsonl") if not f.stem.endswith("_extra")):
-        with open(jsonl_file, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
-        print(f"  [JSONL] {jsonl_file.relative_to(ROOT)}  →  {len(records)} records so far")
-    return records
-
-
 def compute_intended_route(row: pd.Series) -> str:
     """Return the intended route for a row, applying manual overrides."""
     folder = row["folder_source"]
