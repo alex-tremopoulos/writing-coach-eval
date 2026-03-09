@@ -2,10 +2,13 @@ datasets==4.0.0
 fsspec==2024.10.0
 fuzzywuzzy==0.18.0
 huggingface_hub==1.4.1
+langchain==1.2.10
+langchain-openai==1.1.10
 Levenshtein==0.27.3
 langgraph==1.0.9
 openai==2.21.0
 pandas==3.0.1
 poetry==2.3.2
 pyarrow==15.0.0
+pydantic==2.12.5
 python-dotenv==1.2.1
