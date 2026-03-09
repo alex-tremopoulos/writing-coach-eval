@@ -1,0 +1,960 @@
+"""Dynamic Rubrics Evaluation Pipeline for Writing Coach V2.
+
+Two-stage async LLM pipeline:
+  Stage 1 — Rubrics Generator: produces rubric items from (query, input, route)
+  Stage 2 — Rubrics Judge: scores each rubric item against the system output
+
+Uses LangChain AzureChatOpenAI for async LLM calls with built-in retry,
+and writes results incrementally as CSV + JSONL for resume support.
+
+Usage:
+  python -m src.evaluation.eval_pipeline --input final_data/all_results.csv --limit 5
+  python -m src.evaluation.eval_pipeline --deployment gpt-4o --concurrency 3
+  python -m src.evaluation.eval_pipeline --routes RESEARCH RESPOND --limit 10
+"""
+
+import asyncio
+import csv
+import json
+import logging
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any
+
+import pandas as pd
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+from src.evaluation.prompt_loader import build_generator_prompts, build_judge_prompts
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+# Disable LangSmith tracing — avoids SSL noise when no LangSmith access is configured
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
+
+logger = logging.getLogger("eval_pipeline")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+DEFAULT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+DEFAULT_TEMPERATURE = 0.3
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_CONCURRENCY = 5
+MAX_RETRIES = 3  # passed to LangChain AzureChatOpenAI max_retries
+
+EVAL_CSV_FIELDNAMES = [
+    "row_id",
+    "route",
+    "rubrics_count",
+    "rubrics_passed",
+    "rubrics_failed",
+    "score",
+    "meta_rubrics_count",
+    "meta_rubrics_passed",
+    "meta_rubrics_failed",
+    "meta_score",
+    "status",
+]
+
+
+# ---------------------------------------------------------------------------
+# LangChain Azure OpenAI model (cached per parameter set)
+# ---------------------------------------------------------------------------
+
+_model: AzureChatOpenAI | None = None
+_model_key: tuple | None = None
+
+
+def get_model(
+    deployment: str = DEFAULT_DEPLOYMENT,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> AzureChatOpenAI:
+    """Get or create a cached LangChain AzureChatOpenAI model.
+
+    Re-creates the model only when parameters change.
+    """
+    global _model, _model_key
+    key = (deployment, temperature, max_tokens)
+    if _model is None or _model_key != key:
+        _model = AzureChatOpenAI(
+            azure_deployment=deployment,
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_key=os.environ["AZURE_OPENAI_API_KEY"],
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retries=MAX_RETRIES,
+        )
+        _model_key = key
+        logger.info(
+            "Created AzureChatOpenAI model: deployment=%s, temperature=%.2f, max_tokens=%d",
+            deployment, temperature, max_tokens,
+        )
+    return _model
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+
+async def call_llm(
+    deployment: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> str:
+    """Call Azure OpenAI via LangChain and return the text response.
+
+    LangChain handles retries internally (max_retries on the model).
+
+    Args:
+        deployment: Azure OpenAI deployment name (e.g., 'gpt-4o').
+        system_prompt: System message content.
+        user_prompt: User message content.
+        temperature: Sampling temperature.
+        max_tokens: Maximum tokens in the response.
+
+    Returns:
+        The assistant's response text.
+
+    Raises:
+        Exception: If all retries are exhausted.
+    """
+    model = get_model(deployment, temperature, max_tokens)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+    response = await model.ainvoke(messages)
+    return response.content
+
+
+def parse_json_response(text: str) -> dict | None:
+    """Try to parse a JSON object from an LLM response.
+
+    Handles common issues like markdown code fences wrapping the JSON.
+    Falls back to ``parse_markdown_rubrics`` if the response looks like the
+    structured Markdown rubrics format produced by rubrics_prompt.txt.
+    Returns None if all parsing strategies fail.
+    """
+    # Strip markdown code fences if present
+    cleaned = text.strip()
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: try to parse the structured Markdown rubrics format
+    return parse_markdown_rubrics(text)
+
+
+def parse_markdown_rubrics(text: str) -> dict | None:
+    """Parse the structured Markdown rubrics format produced by rubrics_prompt.txt.
+
+    Extracts ``### Criterion N: [Name]`` sections and their metadata into the
+    ``{"rubrics": [...]}`` structure expected by the pipeline.
+
+    Returns None if the text does not look like rubrics Markdown.
+    """
+    # Must have at least one criterion header to be considered rubrics Markdown
+    criterion_headers = re.findall(
+        r"###\s+Criterion\s+\d+:\s*(.+)", text, re.IGNORECASE
+    )
+    if not criterion_headers:
+        return None
+
+    rubrics = []
+    # Split on criterion headers to process each block individually
+    blocks = re.split(r"(?=###\s+Criterion\s+\d+:)", text, flags=re.IGNORECASE)
+
+    for block in blocks:
+        header_match = re.match(r"###\s+Criterion\s+\d+:\s*(.+)", block, re.IGNORECASE)
+        if not header_match:
+            continue
+
+        criterion_name = header_match.group(1).strip().strip("*")
+
+        description = ""
+        desc_match = re.search(r"\*\*Description\*\*:\s*(.+?)(?=\n\*\*|\n###|$)", block, re.DOTALL)
+        if desc_match:
+            description = desc_match.group(1).strip()
+
+        linked_to = ""
+        linked_match = re.search(r"\*\*Linked to\*\*:\s*(.+)", block)
+        if linked_match:
+            linked_to = linked_match.group(1).strip()
+
+        weight = ""
+        weight_match = re.search(r"\*\*Weight\*\*:\s*(.+)", block)
+        if weight_match:
+            weight = weight_match.group(1).strip()
+
+        # Extract table rows: | Level | Score | Description | Indicators |
+        # Level cells may be bold-formatted: | **Excellent** |
+        levels = []
+        table_rows = re.findall(
+            r"\|\s*\*{0,2}(Excellent|Good|Fair|Poor)\*{0,2}\s*\|\s*(\d)\s*\|([^|]+)\|([^|]+)\|",
+            block,
+            re.IGNORECASE,
+        )
+        for level, score, desc, indicators in table_rows:
+            levels.append({
+                "level": level.strip(),
+                "score": int(score.strip()),
+                "description": desc.strip(),
+                "indicators": indicators.strip(),
+            })
+
+        rubrics.append({
+            "criterion": criterion_name,
+            "description": description,
+            "linked_to": linked_to,
+            "weight": weight,
+            "levels": levels,
+        })
+
+    if not rubrics:
+        return None
+
+    # Extract any overall reasoning/assessment block
+    reasoning = ""
+    reasoning_match = re.search(
+        r"###\s+Overall Assessment Guidelines(.+?)(?=##|$)", text, re.DOTALL | re.IGNORECASE
+    )
+    if reasoning_match:
+        reasoning = reasoning_match.group(1).strip()
+
+    logger.debug("parse_markdown_rubrics: extracted %d criteria", len(rubrics))
+    return {"rubrics": rubrics, "reasoning": reasoning}
+
+
+# ---------------------------------------------------------------------------
+# Resume support
+# ---------------------------------------------------------------------------
+
+
+def load_processed_ids(details_jsonl: Path) -> set:
+    """Return set of row_ids already written to the JSONL output file."""
+    processed = set()
+    if details_jsonl.exists():
+        with open(details_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        processed.add(json.loads(line)["row_id"])
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+    return processed
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+
+def load_input_data(
+    input_path: str,
+    routes: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Load and filter the input dataset.
+
+    Args:
+        input_path: Path to the all_results.csv file.
+        routes: Optional list of routes to filter by (e.g., ['RESEARCH', 'RESPOND']).
+        limit: Optional max number of rows to process.
+
+    Returns:
+        List of row dicts with keys: row_id, query, input, route_intended, output (parsed).
+    """
+    df = pd.read_csv(input_path, encoding="utf-8-sig")
+
+    # Use route_intended as the gold route (fallback to route_orch if missing)
+    route_col = "route_intended" if "route_intended" in df.columns else "route_orch"
+
+    if routes:
+        routes_upper = [r.upper() for r in routes]
+        df = df[df[route_col].str.upper().isin(routes_upper)]
+        logger.info("Filtered to routes %s: %d rows", routes_upper, len(df))
+
+    if limit:
+        df = df.head(limit)
+        logger.info("Limited to first %d rows", limit)
+
+    rows = []
+    for _, row in df.iterrows():
+        # Parse the output JSON column
+        output_data = {}
+        if pd.notna(row.get("output")):
+            try:
+                output_data = json.loads(row["output"])
+            except json.JSONDecodeError:
+                pass
+
+        # Extract the system's response text — try multiple sources
+        response_text = ""
+        if output_data.get("response"):
+            response_text = str(output_data["response"])
+        elif pd.notna(row.get("response")) and row.get("response"):
+            response_text = str(row["response"])
+
+        rows.append({
+            "row_id": int(row["row_id"]),
+            "query": str(row.get("query", "")),
+            "input": str(row.get("input", "")),
+            "route": str(row.get(route_col, "UNKNOWN")),
+            "response_text": response_text,
+            "output_data": output_data,
+        })
+
+    logger.info("Loaded %d rows from %s", len(rows), input_path)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Core pipeline: process a single row
+# ---------------------------------------------------------------------------
+
+
+async def process_row(
+    row: dict[str, Any],
+    deployment: str,
+    temperature: float,
+    max_tokens: int,
+    semaphore: asyncio.Semaphore,
+    generator_only: bool = False,
+) -> dict[str, Any]:
+    """Run Stage 1 (generate rubrics) and optionally Stage 2 (judge rubrics) for one row.
+
+    Args:
+        row: Dict with row_id, query, input, route, response_text, output_data.
+        deployment: Azure OpenAI deployment name.
+        temperature: LLM temperature.
+        max_tokens: Max tokens per LLM call.
+        semaphore: Concurrency limiter.
+        generator_only: If True, stop after Stage 1 and skip the judge.
+
+    Returns:
+        Dict with full evaluation results for this row.
+    """
+    row_id = row["row_id"]
+    result = {
+        "row_id": row_id,
+        "route": row["route"],
+        "status": "OK",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Stage 1 outputs
+        "generator_raw_response": None,
+        "rubrics": None,
+        "rubrics_reasoning": None,
+        # Stage 2 outputs
+        "judge_raw_response": None,
+        "verdicts": None,
+        "meta_verdicts": None,
+        "overall_notes": None,
+        # Scores
+        "rubrics_count": 0,
+        "rubrics_passed": 0,
+        "rubrics_failed": 0,
+        "score": 0.0,
+        "meta_rubrics_count": 0,
+        "meta_rubrics_passed": 0,
+        "meta_rubrics_failed": 0,
+        "meta_score": 0.0,
+    }
+
+    async with semaphore:
+        try:
+            # ---- Stage 1: Generate Rubrics ----
+            logger.info("Row %d: Stage 1 — Generating rubrics (route=%s)", row_id, row["route"])
+
+            gen_system, gen_user = build_generator_prompts(
+                user_query=row["query"],
+                input_text=row["input"],
+                route=row["route"],
+            )
+
+            gen_response = await call_llm(
+                deployment=deployment,
+                system_prompt=gen_system,
+                user_prompt=gen_user,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            result["generator_raw_response"] = gen_response
+
+            gen_parsed = parse_json_response(gen_response)
+            if gen_parsed is None:
+                logger.warning("Row %d: Failed to parse generator JSON response", row_id)
+                result["status"] = "GENERATOR_PARSE_ERROR"
+                return result
+
+            rubrics = gen_parsed.get("rubrics", [])
+            result["rubrics"] = rubrics
+            result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
+            result["rubrics_count"] = len(rubrics)
+
+            if not rubrics:
+                logger.warning("Row %d: Generator produced zero rubrics", row_id)
+                result["status"] = "NO_RUBRICS"
+                return result
+
+            # Stop here if only Stage 1 was requested
+            if generator_only:
+                logger.info("Row %d: Generator-only mode — skipping judge", row_id)
+                result["status"] = "GENERATOR_ONLY"
+                return result
+
+            # Check if we have output text to judge
+            if not row["response_text"]:
+                logger.warning("Row %d: No response text available to judge", row_id)
+                result["status"] = "NO_OUTPUT_TEXT"
+                return result
+
+            # ---- Stage 2: Judge Rubrics ----
+            logger.info("Row %d: Stage 2 — Judging %d rubrics", row_id, len(rubrics))
+
+            rubrics_str = json.dumps(rubrics, indent=2, ensure_ascii=False)
+
+            judge_system, judge_user = build_judge_prompts(
+                user_query=row["query"],
+                input_text=row["input"],
+                output_text=row["response_text"],
+                rubrics=rubrics_str,
+            )
+
+            judge_response = await call_llm(
+                deployment=deployment,
+                system_prompt=judge_system,
+                user_prompt=judge_user,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            result["judge_raw_response"] = judge_response
+
+            judge_parsed = parse_json_response(judge_response)
+            if judge_parsed is None:
+                logger.warning("Row %d: Failed to parse judge JSON response", row_id)
+                result["status"] = "JUDGE_PARSE_ERROR"
+                return result
+
+            # Process verdicts
+            verdicts = judge_parsed.get("verdicts", [])
+            result["verdicts"] = verdicts
+            result["overall_notes"] = judge_parsed.get("overall_notes", "")
+
+            passed = sum(1 for v in verdicts if v.get("verdict", "").upper() == "MET")
+            failed = len(verdicts) - passed
+            result["rubrics_passed"] = passed
+            result["rubrics_failed"] = failed
+            result["score"] = round(passed / len(verdicts), 4) if verdicts else 0.0
+
+            # Process meta-verdicts
+            meta_verdicts = judge_parsed.get("meta_verdicts", [])
+            result["meta_verdicts"] = meta_verdicts
+            result["meta_rubrics_count"] = len(meta_verdicts)
+
+            meta_passed = sum(1 for v in meta_verdicts if v.get("verdict", "").upper() == "MET")
+            result["meta_rubrics_passed"] = meta_passed
+            result["meta_rubrics_failed"] = len(meta_verdicts) - meta_passed
+            result["meta_score"] = (
+                round(meta_passed / len(meta_verdicts), 4) if meta_verdicts else 0.0
+            )
+
+            logger.info(
+                "Row %d: Score=%.2f (%d/%d passed), Meta=%.2f (%d/%d)",
+                row_id,
+                result["score"],
+                passed,
+                len(verdicts),
+                result["meta_score"],
+                meta_passed,
+                len(meta_verdicts),
+            )
+
+        except Exception as e:
+            logger.error("Row %d: Error — %s", row_id, e)
+            result["status"] = "ERROR"
+            result["error"] = str(e)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Output writing (thread-safe with asyncio.Lock)
+# ---------------------------------------------------------------------------
+
+
+class OutputWriter:
+    """Thread-safe incremental writer for CSV + JSONL evaluation outputs."""
+
+    def __init__(self, output_dir: Path, run_name: str):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.results_csv = output_dir / f"{run_name}_results.csv"
+        self.details_jsonl = output_dir / f"{run_name}_details.jsonl"
+        self._lock = asyncio.Lock()
+
+        # Open files in append mode
+        csv_is_new = not self.results_csv.exists() or self.results_csv.stat().st_size == 0
+        self._csv_file = open(self.results_csv, "a", newline="", encoding="utf-8")
+        self._jsonl_file = open(self.details_jsonl, "a", encoding="utf-8")
+
+        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=EVAL_CSV_FIELDNAMES)
+        if csv_is_new:
+            self._csv_writer.writeheader()
+            self._csv_file.flush()
+
+    async def write_result(self, result: dict[str, Any]) -> None:
+        """Write one evaluation result to both CSV and JSONL."""
+        async with self._lock:
+            # CSV — summary row
+            self._csv_writer.writerow({
+                "row_id": result["row_id"],
+                "route": result["route"],
+                "rubrics_count": result["rubrics_count"],
+                "rubrics_passed": result["rubrics_passed"],
+                "rubrics_failed": result["rubrics_failed"],
+                "score": result["score"],
+                "meta_rubrics_count": result["meta_rubrics_count"],
+                "meta_rubrics_passed": result["meta_rubrics_passed"],
+                "meta_rubrics_failed": result["meta_rubrics_failed"],
+                "meta_score": result["meta_score"],
+                "status": result["status"],
+            })
+            self._csv_file.flush()
+
+            # JSONL — full details
+            self._jsonl_file.write(json.dumps(result, ensure_ascii=False) + "\n")
+            self._jsonl_file.flush()
+
+    def close(self) -> None:
+        """Close output files."""
+        self._csv_file.close()
+        self._jsonl_file.close()
+
+    @property
+    def details_path(self) -> Path:
+        return self.details_jsonl
+
+    @property
+    def results_path(self) -> Path:
+        return self.results_csv
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+
+async def run_pipeline(
+    input_path: str,
+    output_dir: str = "data_outputs/eval",
+    deployment: str = DEFAULT_DEPLOYMENT,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    routes: list[str] | None = None,
+    limit: int | None = None,
+    resume: bool = True,
+    run_name: str | None = None,
+    generator_only: bool = False,
+) -> None:
+    """Run the full dynamic rubrics evaluation pipeline.
+
+    Args:
+        input_path: Path to the input CSV (all_results.csv).
+        output_dir: Directory for evaluation output files.
+        deployment: Azure OpenAI deployment name (e.g., 'gpt-4o').
+        temperature: LLM temperature for both generator and judge.
+        max_tokens: Max tokens per LLM call.
+        concurrency: Max parallel LLM calls.
+        routes: Optional list of routes to filter by.
+        limit: Optional max rows to process.
+        resume: If True, skip rows already in the output JSONL.
+        run_name: Optional name for output files. Defaults to timestamp-based name.
+        generator_only: If True, run only Stage 1 (rubrics generation) and skip
+            the judge. Useful for testing or inspecting generated rubrics.
+    """
+    if run_name is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"eval_{ts}"
+
+    logger.info("=" * 80)
+    logger.info("DYNAMIC RUBRICS EVALUATION PIPELINE")
+    logger.info("=" * 80)
+    logger.info("Deployment:  %s", deployment)
+    logger.info("Concurrency: %d", concurrency)
+    logger.info("Temperature: %.2f", temperature)
+    logger.info("Input:       %s", input_path)
+    logger.info("Output dir:  %s", output_dir)
+    logger.info("Run name:    %s", run_name)
+    if generator_only:
+        logger.info("Mode:        GENERATOR ONLY (Stage 1, no judge)")
+    logger.info("=" * 80)
+
+    # Load data
+    rows = load_input_data(input_path, routes=routes, limit=limit)
+    if not rows:
+        logger.warning("No rows to process. Exiting.")
+        return
+
+    # Set up output writer
+    writer = OutputWriter(Path(output_dir), run_name)
+
+    # Resume support
+    if resume:
+        processed_ids = load_processed_ids(writer.details_path)
+        if processed_ids:
+            before = len(rows)
+            rows = [r for r in rows if r["row_id"] not in processed_ids]
+            logger.info(
+                "Resume: %d rows already processed, %d remaining",
+                before - len(rows),
+                len(rows),
+            )
+
+    if not rows:
+        logger.info("All rows already processed. Nothing to do.")
+        writer.close()
+        return
+
+    # Set up concurrency control
+    semaphore = asyncio.Semaphore(concurrency)
+
+    # Create tasks for all rows
+    async def process_and_write(row: dict) -> dict:
+        result = await process_row(
+            row, deployment, temperature, max_tokens, semaphore,
+            generator_only=generator_only,
+        )
+        await writer.write_result(result)
+        return result
+
+    logger.info("Processing %d rows with concurrency=%d...", len(rows), concurrency)
+    start_time = time.time()
+
+    tasks = [process_and_write(row) for row in rows]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    elapsed = time.time() - start_time
+
+    # Handle any exceptions from gather
+    actual_results = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.error("Row task %d raised exception: %s", i, r)
+        else:
+            actual_results.append(r)
+
+    writer.close()
+
+    # Build enriched all_results copy with eval columns appended
+    enriched_paths = build_enriched_output(
+        input_path=input_path,
+        details_jsonl=writer.details_path,
+        output_dir=Path(output_dir),
+        run_name=run_name,
+    )
+
+    # Print summary
+    _print_summary(actual_results, elapsed, writer, enriched_paths)
+
+
+def build_enriched_output(
+    input_path: str,
+    details_jsonl: Path,
+    output_dir: Path,
+    run_name: str,
+) -> tuple[Path, Path] | None:
+    """Create enriched copies of all_results files with eval columns appended.
+
+    Reads the original input CSV, loads all evaluation results from the JSONL
+    (which may include results from previous resumed runs), merges by ``row_id``,
+    and writes two new files in the same output directory:
+
+    - ``{run_name}_all_results_enriched.csv``
+    - ``{run_name}_all_results_enriched.jsonl``
+
+    The original ``all_results.csv`` and ``all_results.jsonl`` in ``final_data/``
+    are never modified.
+
+    Args:
+        input_path: Path to the original all_results.csv used as input.
+        details_jsonl: Path to the eval details JSONL (accumulates all runs).
+        output_dir: Directory where enriched files will be written.
+        run_name: Run name prefix for output files.
+
+    Returns:
+        Tuple of (enriched_csv_path, enriched_jsonl_path), or None on failure.
+    """
+    # Load all eval results indexed by row_id (from JSONL — includes resumed rows)
+    eval_by_id: dict[int, dict] = {}
+    if details_jsonl.exists():
+        with open(details_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rec = json.loads(line)
+                        eval_by_id[int(rec["row_id"])] = rec
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+    if not eval_by_id:
+        logger.warning(
+            "No eval results found in %s — skipping enriched output", details_jsonl
+        )
+        return None
+
+    # Load original CSV
+    df = pd.read_csv(input_path, encoding="utf-8-sig")
+
+    # New eval columns
+    eval_cols = [
+        "eval_status",
+        "eval_timestamp",
+        "eval_rubrics_count",
+        "eval_rubrics_passed",
+        "eval_rubrics_failed",
+        "eval_score",
+        "eval_meta_rubrics_count",
+        "eval_meta_rubrics_passed",
+        "eval_meta_rubrics_failed",
+        "eval_meta_score",
+        "eval_overall_notes",
+        "eval_rubrics",        # JSON string of generated rubric items
+        "eval_verdicts",       # JSON string of judge verdicts
+        "eval_meta_verdicts",  # JSON string of meta-rubric verdicts
+        "eval_generator_raw",  # Raw LLM text from Stage 1
+        "eval_judge_raw",      # Raw LLM text from Stage 2
+    ]
+    for col in eval_cols:
+        df[col] = None
+
+    def _to_json_str(val: Any) -> str | None:
+        if val is None:
+            return None
+        if isinstance(val, str):
+            return val
+        return json.dumps(val, ensure_ascii=False)
+
+    matched = 0
+    for idx, row in df.iterrows():
+        rid = int(row["row_id"])
+        if rid not in eval_by_id:
+            continue
+        ev = eval_by_id[rid]
+        df.at[idx, "eval_status"] = ev.get("status")
+        df.at[idx, "eval_timestamp"] = ev.get("timestamp")
+        df.at[idx, "eval_rubrics_count"] = ev.get("rubrics_count", 0)
+        df.at[idx, "eval_rubrics_passed"] = ev.get("rubrics_passed", 0)
+        df.at[idx, "eval_rubrics_failed"] = ev.get("rubrics_failed", 0)
+        df.at[idx, "eval_score"] = ev.get("score", 0.0)
+        df.at[idx, "eval_meta_rubrics_count"] = ev.get("meta_rubrics_count", 0)
+        df.at[idx, "eval_meta_rubrics_passed"] = ev.get("meta_rubrics_passed", 0)
+        df.at[idx, "eval_meta_rubrics_failed"] = ev.get("meta_rubrics_failed", 0)
+        df.at[idx, "eval_meta_score"] = ev.get("meta_score", 0.0)
+        df.at[idx, "eval_overall_notes"] = ev.get("overall_notes")
+        df.at[idx, "eval_rubrics"] = _to_json_str(ev.get("rubrics"))
+        df.at[idx, "eval_verdicts"] = _to_json_str(ev.get("verdicts"))
+        df.at[idx, "eval_meta_verdicts"] = _to_json_str(ev.get("meta_verdicts"))
+        df.at[idx, "eval_generator_raw"] = ev.get("generator_raw_response")
+        df.at[idx, "eval_judge_raw"] = ev.get("judge_raw_response")
+        matched += 1
+
+    logger.info(
+        "Enriched output: %d/%d rows have eval data", matched, len(df)
+    )
+
+    enriched_csv = output_dir / f"{run_name}_all_results_enriched.csv"
+    df.to_csv(enriched_csv, index=False, encoding="utf-8")
+    logger.info("Enriched CSV written: %s", enriched_csv)
+
+    enriched_jsonl = output_dir / f"{run_name}_all_results_enriched.jsonl"
+    with open(enriched_jsonl, "w", encoding="utf-8") as f:
+        for _, row in df.iterrows():
+            f.write(json.dumps(row.to_dict(), ensure_ascii=False, default=str) + "\n")
+    logger.info("Enriched JSONL written: %s", enriched_jsonl)
+
+    return enriched_csv, enriched_jsonl
+
+
+def _print_summary(
+    results: list[dict[str, Any]],
+    elapsed: float,
+    writer: OutputWriter,
+    enriched_paths: tuple[Path, Path] | None = None,
+) -> None:
+    """Print evaluation summary to console."""
+    print("\n" + "=" * 80)
+    print("EVALUATION SUMMARY")
+    print("=" * 80)
+    print(f"Total rows evaluated: {len(results)}")
+    print(f"Elapsed time: {elapsed:.1f}s")
+    print()
+
+    # Status breakdown
+    from collections import Counter  # noqa: E402
+
+    status_counts = Counter(r["status"] for r in results)
+    print("Status breakdown:")
+    for status, count in status_counts.most_common():
+        print(f"  {status:30} {count:4}")
+
+    # Score summary by route
+    ok_results = [r for r in results if r["status"] == "OK"]
+    if ok_results:
+        print()
+        print("Scores by route:")
+        route_scores: dict[str, list[float]] = {}
+        for r in ok_results:
+            route_scores.setdefault(r["route"], []).append(r["score"])
+
+        for route in sorted(route_scores):
+            scores = route_scores[route]
+            avg_score = sum(scores) / len(scores)
+            print(f"  {route:20} avg={avg_score:.3f}  n={len(scores)}")
+
+        # Overall
+        all_scores = [r["score"] for r in ok_results]
+        overall_avg = sum(all_scores) / len(all_scores)
+        print(f"  {'OVERALL':20} avg={overall_avg:.3f}  n={len(all_scores)}")
+
+    print()
+    print(f"Outputs saved:")
+    print(f"  Summary  : {writer.results_path}")
+    print(f"  Details  : {writer.details_path}")
+    if enriched_paths:
+        print(f"  Enriched CSV  : {enriched_paths[0]}")
+        print(f"  Enriched JSONL: {enriched_paths[1]}")
+    print("=" * 80)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Dynamic Rubrics Evaluation Pipeline for Writing Coach V2",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python -m src.evaluation.eval_pipeline --input final_data/all_results.csv --limit 5\n"
+            "  python -m src.evaluation.eval_pipeline --deployment gpt-4o --concurrency 3\n"
+            "  python -m src.evaluation.eval_pipeline --routes RESEARCH RESPOND --limit 10\n"
+            "  python -m src.evaluation.eval_pipeline --run-name my_experiment\n"
+            "\nEnvironment variables (Azure OpenAI):\n"
+            "  AZURE_OPENAI_ENDPOINT    — Azure OpenAI endpoint URL\n"
+            "  AZURE_OPENAI_API_KEY     — Azure OpenAI API key\n"
+            "  AZURE_OPENAI_API_VERSION — API version (default: 2025-01-01-preview)\n"
+            "  AZURE_OPENAI_DEPLOYMENT  — Default deployment name (default: gpt-4o)\n"
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        default="final_data/all_results.csv",
+        help="Path to input CSV with system outputs (default: final_data/all_results.csv)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="data_outputs/eval",
+        help="Output directory for evaluation results (default: data_outputs/eval)",
+    )
+    parser.add_argument(
+        "--deployment",
+        default=DEFAULT_DEPLOYMENT,
+        help=f"Azure OpenAI deployment name (default: {DEFAULT_DEPLOYMENT})",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help=f"LLM temperature (default: {DEFAULT_TEMPERATURE})",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help=f"Max tokens per LLM call (default: {DEFAULT_MAX_TOKENS})",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"Max parallel LLM calls (default: {DEFAULT_CONCURRENCY})",
+    )
+    parser.add_argument(
+        "--routes",
+        nargs="+",
+        default=None,
+        help="Only evaluate rows with these routes (e.g., RESEARCH RESPOND)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max number of rows to process (for testing)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume — reprocess all rows even if already in output",
+    )
+    parser.add_argument(
+        "--generator-only",
+        action="store_true",
+        help="Run Stage 1 only (rubrics generation) — skip the judge. Useful for testing.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Name for output files (default: eval_YYYYMMDD_HHMMSS)",
+    )
+
+    args = parser.parse_args()
+
+    asyncio.run(
+        run_pipeline(
+            input_path=args.input,
+            output_dir=args.output_dir,
+            deployment=args.deployment,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            concurrency=args.concurrency,
+            routes=args.routes,
+            limit=args.limit,
+            resume=not args.no_resume,
+            run_name=args.run_name,
+            generator_only=args.generator_only,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
