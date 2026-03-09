@@ -139,8 +139,6 @@ The system prompt given to the AI agent executing the selected route. This defin
 
 **Example**: A REVISE_SIMPLE route prompt might emphasize "preserve author voice" and "suggest minimal necessary changes", while REVISE_RESEARCH might prioritize "integrate citations smoothly" and "find high-quality sources".
 
-## ROUTE RUBRICS CONSTRAINTS
-
 # EXPECTED OUTPUT
 Generate a comprehensive rubrics in the following structured format:
 
@@ -343,10 +341,6 @@ Use this checklist:
 <route_prompt>
 {route_prompt}
 </route_prompt>
-
-<route_rubrics_constraints>
-{route_rubrics_constraints}
-</route_rubrics_constraints>
 
 ---
 
