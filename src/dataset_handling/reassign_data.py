@@ -94,12 +94,18 @@ EXTRA_RESPOND_PREV_IDS = set(range(1, 10))   # prev_id 1–9
 # Helpers
 # ---------------------------------------------------------------------------
 
-def read_csv_files(folder: Path) -> pd.DataFrame:
+def read_jsonl_files(folder: Path) -> pd.DataFrame:
     frames = []
-    for csv_file in sorted(f for f in folder.glob("*.csv") if not f.stem.endswith("_extra")):
-        df = pd.read_csv(csv_file)
+    for jsonl_file in sorted(f for f in folder.glob("*.jsonl") if not f.stem.endswith("_extra")):
+        records = []
+        with open(jsonl_file, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        df = pd.DataFrame(records)
         frames.append(df)
-        print(f"  [CSV]  {csv_file.relative_to(ROOT)}  →  {len(df)} rows")
+        print(f"  [JSONL] {jsonl_file.relative_to(ROOT)}  →  {len(df)} rows")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -238,7 +244,7 @@ def main() -> None:
             continue
 
         print(f"\n{folder_name}/")
-        df = read_csv_files(folder)
+        df = read_jsonl_files(folder)
         if not df.empty:
             df["folder_source"] = folder_name
             all_frames.append(df)
