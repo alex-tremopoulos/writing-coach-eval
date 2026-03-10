@@ -1,160 +1,184 @@
 # writing-coach-eval
 
-Evaluation framework for **Writing Coach V2** — a conversational, LangGraph-based writing assistant. The framework builds a labelled dataset from public writing/editing corpora, augments it with LLM-synthesised domain data, runs the Writing Coach against every example in batch, and captures routing decisions and responses for downstream evaluation.
+Evaluation workspace for Writing Coach V2. The repository is mainly built to prepare evaluation inputs, run the system in batch, normalize outputs into a reviewable dataset, and score those outputs with a dynamic rubrics pipeline.
 
----
+## What This Repository Covers
 
-## Overview
+The evaluation flow has four practical stages:
 
-Writing Coach V2 classifies every incoming user query into one of four **routes** and processes it through a matching graph path:
+1. Build or extend route-labeled evaluation data.
+2. Run Writing Coach V2 on each row and capture routing plus model outputs.
+3. Consolidate those outputs into a single evaluation dataset with intended-route labels and final returned text.
+4. Score the results with a two-stage LLM evaluation pipeline.
 
-| Route | Description |
+Writing Coach routes each example into one of four task types:
+
+| Route | Purpose |
 |---|---|
-| `REVISE_SIMPLE` | Style, grammar, tone, clarity edits that do not require external evidence |
-| `REVISE_RESEARCH` | Text improvements that require finding supporting evidence or references |
-| `RESPOND` | Summarise, compare, analyse, or answer questions about provided content |
-| `RESEARCH` | Find papers, explore literature, validate claims against published work |
+| `REVISE_SIMPLE` | Edit text without external research |
+| `REVISE_RESEARCH` | Revise text and add evidence or citations |
+| `RESPOND` | Answer, summarize, compare, or discuss based on given context |
+| `RESEARCH` | Search literature and return evidence-grounded findings |
 
-The evaluation pipeline **so far** has three stages:
+## Evaluation Pipeline
 
-1. **Dataset construction** — merge public datasets and label rows by route.
-2. **Data synthesis** — use Azure OpenAI to expand the dataset with domain-adapted examples.
-3. **Batch inference** — run Writing Coach V2 on every row and store outputs for analysis.
+The core evaluation logic lives in `src/evaluation/eval_pipeline.py`.
 
----
+It uses a two-stage asynchronous process:
 
-## Repository structure
+1. **Rubrics generation**: given a row's `query`, `input`, and intended `route`, the model generates task-specific rubric criteria.
+2. **Rubrics judging**: a second call scores the system output against those generated criteria.
 
+The pipeline is designed for batch work rather than one-off inspection:
+
+- Async concurrency with a semaphore limit
+- Incremental CSV and JSONL writing for resume support
+- Route filtering and row limits for targeted runs
+- Generator-only mode for inspecting rubric quality without running the judge
+- Enriched outputs that merge evaluation results back onto the original dataset rows
+
+The default evaluation input is `final_data/all_results_with_final_text.csv`, which contains the normalized system output text that should be judged.
+
+## Prompt Structure And Strategy
+
+Prompt assembly is handled by `src/evaluation/prompt_loader.py`.
+
+The evaluation prompts are intentionally split into two layers:
+
+- `src/prompts/rubrics_prompt.txt`: generates dynamic rubrics for the specific task instance
+- `src/prompts/rubrics_judge_prompt.txt`: scores the returned output against those rubrics
+
+Each prompt file uses a simple block structure:
+
+```text
+{% block system %}
+...
+{% endblock %}
+
+{% block prompt %}
+...
+{% endblock %}
 ```
-writing-coach-eval/
-├── data/                              # CSV datasets and query lists
-│   ├── data_routes_original.csv       # Merged public dataset (52 rows)
-│   ├── data_routes_processed.csv      # Processed version used as synthesis input
-│   ├── data_routes_synthetic.csv      # Synthesised rows only
-│   ├── data_routes_expanded.csv       # Original + synthetic (208 rows, 52 per route)
-│   └── queries/                       # Distinct query lists extracted during exploration
-├── src/
-│   ├── store_output.py                # Batch inference runner
-│   ├── evaluation/
-│   │   ├── merge_public_datasets.py   # Build data_routes_original.csv from public HF datasets
-│   │   ├── synthesize_domain_data.py  # Synthesise domain-adapted rows via Azure OpenAI
-│   │   └── notebooks/
-│   │       └── merge_public_datasets.ipynb  # Interactive version of the merge script
-│   └── wc_src/                        # Writing Coach V2 source (graph, nodes, prompts)
-```
 
----
+That separation keeps the evaluation pipeline maintainable: stable evaluator behavior stays in the system block, while row-specific inputs are injected into the prompt block.
 
-## Public datasets used
+The rubric-generation strategy combines four sources of context:
 
-| Dataset | Source | Route(s) |
-|---|---|---|
-| [OpenRewriteEval](https://huggingface.co/datasets/gabrielmbmb/OpenRewriteEval) | HuggingFace | REVISE_SIMPLE, REVISE_RESEARCH, RESPOND |
-| [CoEdiT](https://huggingface.co/datasets/grammarly/coedit) | HuggingFace / Grammarly | REVISE_SIMPLE |
-| [Kiwi](https://huggingface.co/datasets/fangyuan/kiwi) | HuggingFace | REVISE_SIMPLE, REVISE_RESEARCH, RESPOND, RESEARCH |
+- The user command
+- The original input text
+- Route-specific behavior guidance from `src/constants/route_prompts.py`
+- Shared evaluation dimensions from `src/constants/metrics_definitions.py`
 
-Each dataset is filtered to queries that map cleanly onto a Writing Coach route, producing `(input, query, target)` triplets.
+Current metrics are deliberately narrow: the generated rubrics focus mainly on output relevancy and completeness. This keeps scoring aligned to the user request and route behavior rather than drifting into unrelated quality dimensions.
 
----
+The route-constraint hook exists in `src/constants/route_constraints.py`. It is currently minimal, but the structure is already in place for tightening route-specific rubric rules later.
 
-## Setup
+## Important Dataset Handling
 
-### Prerequisites
+Most dataset work lives in `src/dataset_handling/`. The important pieces for evaluation are:
 
-- Python 3.10+
-- Access to Writing Coach V2 source under `src/wc_src/` (not included here)
-- An Azure OpenAI deployment for data synthesis
+- `merge_public_datasets.py`: builds the initial labeled base set from public sources
+- `synthesize_domain_data.py`: expands coverage with synthetic domain-adapted examples
+- `generate_eval_dataset.py`: creates the focused 21-row evaluation set used for Writing Coach examples
+- `reassign_data.py`: consolidates batch outputs from multiple route folders into a single `all_results` dataset and applies intended-route overrides where needed
 
-### Install dependencies
+For evaluation, `reassign_data.py` matters because it turns scattered run outputs into a single table with:
+
+- A new global `row_id`
+- The original source folder and prior row id
+- `route_orch` and `route_intended`
+- A nested `output` payload with response data, suggestions, references, and tool usage
+- `dataset_source` mapping back to the original dataset when possible
+
+After consolidation, `src/build_final_text.py` computes `returned_final_text`. For `RESPOND` and `RESEARCH`, this is the response text directly. For revision routes, it applies all proposed suggestions to the original input so the evaluator scores the effective final text rather than the raw suggestion list.
+
+## Running The Flow
+
+### Setup
+
+Requirements:
+
+- Python 3.12
+- Access to the Writing Coach V2 source under `src/wc_src/`
+- Azure OpenAI credentials for synthesis and evaluation
+
+Install dependencies:
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate       # Windows
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Environment variables
+Environment variables:
 
-Create a `.env` file in the repo root for the synthesis and batch inference steps:
-
-```
+```env
 AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
 AZURE_OPENAI_API_KEY=<your-key>
 AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT=<your-deployment-name>
 ```
 
----
-
-## Usage
-
-### 1. Build the merged public dataset
+### 1. Run batch inference
 
 ```bash
-python src/evaluation/merge_public_datasets.py
-```
-
-Reads the three public datasets from Hugging Face, filters and labels rows by route, and writes `data/data_routes_original.csv` (52 rows, ~13 per route).
-
-The interactive notebook at `src/evaluation/notebooks/merge_public_datasets.ipynb` provides the same pipeline with exploratory outputs.
-
-### 2. Synthesise domain-adapted data
-
-```bash
-python src/evaluation/synthesize_domain_data.py
-```
-
-Takes `data/data_routes_processed.csv` as input and uses Azure OpenAI to generate:
-- **84 domain-adapted rows** — 28 CS rows × 3 domains (Physics, Biochemistry, Humanities & Social Sciences)
-- **72 generic rows** — 36 REVISE_SIMPLE + 24 REVISE_RESEARCH + 12 RESPOND
-
-Combined with the original 52 rows this produces **208 rows (52 per route)**, saved to:
-- `data/data_routes_synthetic.csv` — new rows only
-- `data/data_routes_expanded.csv` — full expanded dataset
-
-Synthesis is resumable: a checkpoint file (`data/.synthesis_checkpoint.json`) tracks completed rows.
-
-### 3. Run batch inference
-
-```bash
-# Process all routes
 python -m src.store_output data/data_routes_expanded.csv
-
-# Process a single route only
-python -m src.store_output data/data_routes_expanded.csv --route RESEARCH
-
-# Custom output directory
-python -m src.store_output data/data_routes_expanded.csv --output my_results
 ```
 
-Results are written incrementally to `batch_outputs/` after each row so runs can be safely interrupted and resumed:
+This runs Writing Coach V2 over the dataset and stores routing decisions plus structured outputs.
 
-- `<stem>_results.csv` — summary per row (route, intent, response length, tool counts)
-- `<stem>_details.jsonl` — full output per row (response text, suggestions, references, papers)
----
+### 2. Consolidate outputs for evaluation
 
-## Data schema
+```bash
+python src/dataset_handling/reassign_data.py
+python src/build_final_text.py
+```
 
-The dataset CSVs use the following columns:
+This produces:
 
-| Column | Description |
-|---|---|
-| `query` | The user instruction to Writing Coach |
-| `input` | The document or text the query acts on |
-| `target` | Expected/reference output (from the source dataset) |
-| `dataset` | Source dataset name (`OpenRewriteEval`, `CoEdiT`, `Kiwi`) |
-| `route` | Ground-truth route label (`REVISE_SIMPLE`, `REVISE_RESEARCH`, `RESPOND`, `RESEARCH`) |
+- `final_data/all_results.csv`
+- `final_data/all_results.jsonl`
+- `final_data/all_results_with_final_text.csv`
+- `final_data/all_results_with_final_text.jsonl`
 
----
+### 3. Run the evaluation pipeline
+
+```bash
+python -m src.evaluation.eval_pipeline --input final_data/all_results_with_final_text.csv
+```
+
+Useful options:
+
+- `--routes RESEARCH RESPOND`
+- `--limit 10`
+- `--concurrency 3`
+- `--generator-only`
+
+Evaluation outputs are written to `data_outputs/eval/` as:
+
+- `*_results.csv`: per-row summary scores and packed JSON fields
+- `*_details.jsonl`: full generator and judge outputs
+- `*_all_results_enriched.csv`
+- `*_all_results_enriched.jsonl`
+
+## Repository Pointers
+
+- `src/store_output.py`: batch inference runner for Writing Coach V2
+- `src/dataset_handling/`: dataset construction and consolidation scripts
+- `src/build_final_text.py`: derives final text for evaluation
+- `src/evaluation/eval_pipeline.py`: async rubrics evaluation pipeline
+- `src/evaluation/prompt_loader.py`: prompt parsing and slot injection
+- `src/prompts/`: evaluation prompt templates
+- `src/constants/`: route prompts, route constraints, and metric definitions
 
 ## Dependencies
 
-See [requirements.txt](requirements.txt). Key packages:
+Key packages:
 
-- `langgraph` — Writing Coach V2 graph execution
-- `openai` — Azure OpenAI client (data synthesis)
-- `pandas`, `pyarrow` — data manipulation and Parquet support
-- `huggingface_hub`, `datasets`, `fsspec` — public dataset access
-- `fuzzywuzzy`, `Levenshtein` — fuzzy query matching during dataset merging
-- `python-dotenv` — environment variable loading
+- `langgraph` for Writing Coach graph execution
+- `langchain` and `langchain-openai` for async evaluation calls
+- `openai` for Azure OpenAI access
+- `pandas` and `pyarrow` for dataset handling
+- `datasets` and `huggingface_hub` for public data ingestion
+- `python-dotenv` for environment loading
 
