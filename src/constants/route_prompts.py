@@ -4,8 +4,11 @@ Each entry contains the orchestrator prompt section that describes when and how
 a given route is used. These are passed verbatim into the rubrics generator as
 context so it can build route-aware evaluation criteria.
 
-Keys must match the route names used in all_results.csv:
+Route-specific keys must match the route names used in all_results.csv:
     RESEARCH, RESPOND, REVISE_SIMPLE, REVISE_RESEARCH
+
+Additional shared keys:
+    UNIVERSAL: guidance included alongside every route-specific prompt
 """
 
 ROUTE_PROMPTS: dict[str, str] = {
@@ -19,11 +22,11 @@ RESEARCH is used when:
 - The query requires searching academic databases for new information.
 - The user asks evidence-based questions that can only be answered by searching the literature: "is this idea unique?", "has this been done before?", "is this novel?", "is there prior work on this?", "who else has studied this?". These look like questions but require a literature search to answer properly.
 - The user introduces a research topic and wants to understand the landscape, scope the field, or plan how to study it. Questions like "I want to look at X", "how would I approach X", "what are the pros/cons of studying X", "what do we know about X" require a literature search to answer meaningfully. Without seeing what actually exists, the response is generic methodology advice — grounding it in real papers is what makes this tool valuable.
-**Trigger verbs**: find, search, explore, verify, validate, check, discover, review, look up, what's known, is this supported, evidence for, is this unique, is this novel, has this been done, who else, prior work, I want to look at, how would I approach, what do we know about, scope, landscape, what are the approaches
+**Trigger verbs**: find, search, explore, verify, validate, check, discover, review, look up, what's known, is this supported, evidence for, is this unique, is this novel, has this been done, who else, prior work, I want to look at, how would I approach, what do we know about, scope, landscape, what are the approaches, tell me more, go deeper, find additional
 **Intent mapping**:
 - validate_claims: checking if claims are supported by evidence
 - explore_literature: finding papers on a topic
-- identify_gaps: finding what's missing in the argumen
+- identify_gaps: finding what's missing in the argument
 """,
 
     "RESPOND": """\
@@ -36,10 +39,12 @@ RESPOND is used when:
 - The user makes meta-commentary ("What do you think?", "Is this approach reasonable?").
 - The user asks about the assistant's capabilities or how to use it.
 - The message is a follow-up question about previously found papers that doesn't require new search.
+- "Apply those findings" when no papers exist in the conversation → RESPOND (clarify what's needed)
 - Examples: "Summarise what you found", "Compare those papers", "What do you think?", "Is this approach reasonable?"
 **Key distinction — subject matter vs. writing process**: RESPOND is for questions about writing process, document organisation, or existing information ("How should I structure this section?", "Summarise what you found", "What order should my arguments go in?"). Questions about the document's **subject matter and claims** — their strength, validity, completeness, or defensibility — benefit from evidence and should go to RESEARCH, even when phrased conversationally ("What would a reviewer say?", "What's wrong with this argument?", "Challenge this", "What am I missing?", "Is this convincing?"). Similarly, questions about how to **approach a research topic** ("how would you study X?", "what are the approaches to X?", "I want to look at X") are research scoping questions — they need the literature landscape to answer well and belong in RESEARCH, not RESPOND. The test: could the response be meaningfully improved by citing actual papers? If yes → RESEARCH.
 **Evidence-based questions go to RESEARCH, not RESPOND**: Questions like "Is this idea unique?", "Has anyone done this before?", or "Is this novel?" require a literature search to answer — they cannot be answered from the document or conversation alone. Route these to RESEARCH. RESPOND is for questions answerable from existing context: "What do you think of my structure?", "Summarise what you found", "How should I organise this section?"
 **Trigger verbs**: summarise, compare, explain, what did you mean, organise, recap, what do you think, how should I structure, how should I organise
+**Is the selected text a table?** If the selected text is primarily an HTML table (`<table>...</table>`), a markdown pipe table, or a LaTeX tabular — route to RESPOND. The merge system cannot reliably splice changes inside table markup. Explain this to the user and suggest alternatives: select the prose surrounding the table, or ask to rewrite the table as prose paragraphs first.
 
 **NOT RESPOND**: imperative creation commands ("write a paragraph on…", "make a list of…", "create a table comparing…", "draft a section about…") should go to REVISE, not RESPOND — the user wants content produced in their document, not discussed in chat.
 """,
@@ -74,4 +79,53 @@ REVISE_RESEARCH is used when:
 
 **Default for ambiguous revisions**: When a revision command is vague AND no relevant prior research exists in the conversation, use REVISE_RESEARCH. This includes requests to create new sections without detailed instructions about their content.
 """,
+
+    "UNIVERSAL": """\
+    # MINDSET & PRIORITIES
+Think like a helpful research writing mentor:
+1. **Bias toward action**: prefer RESEARCH when the user asks about evidence, literature, or claims. Prefer REVISE when they ask to change text. Use RESPOND only for discussion, synthesis, or questions about existing information.
+2. **Respect user intent**: if the user asks to "improve", "strengthen", or "fix" text, they want REVISE. If they say "find papers" or "what's known about", they want RESEARCH.
+3. **Imperative = document action**: when the user gives instructive commands ("write X", "make a list of…", "create a table comparing…", "draft a paragraph on…"), they want content produced in the document preview, not a chat reply. Route to REVISE_RESEARCH so the output is grounded in evidence, unless the command is purely mechanical (formatting, grammar) in which case use REVISE_SIMPLE.
+4. **Minimal interruption**: only route to RESPOND when the message truly doesn't fit RESEARCH or REVISE.
+5. **Evidence over opinion**: this tool's value comes from grounding feedback in academic literature. When the user asks a question about the strength, validity, or defensibility of claims — whether in their document or about a research topic they're exploring — the answer is always more credible and useful when backed by evidence from the literature — even if they didn't explicitly ask for papers. Route these to RESEARCH, not RESPOND.
+6. **Research scoping needs evidence**: when a user introduces a research topic and asks how to approach it, what the landscape looks like, or what's been done — the useful answer requires seeing what actually exists in the literature. Generic methodology advice (that any LLM could give) wastes this tool's unique capability. Route to RESEARCH so the response is grounded in real papers.
+
+# REVISION ROUTING GUIDE (REVISE_SIMPLE vs REVISE_RESEARCH)
+
+When the user wants text changes, decide between SIMPLE and RESEARCH:
+
+**REVISE_SIMPLE** only for clear, specific instructions:
+- Reformatting: "convert to bullet points", "reformat as table", "turn into a list"
+- Mechanical corrections: "fix grammar", "fix spelling", "fix punctuation"
+- Rewording: "make concise", "simplify", "elaborate", "change tone", "make more formal"
+- Style changes: "shorten sentences", "use active voice", "remove jargon"
+- Applying prior research: "revise using what you found", "incorporate those findings", "apply the feedback from earlier"
+- Adding content with explicit detail: "add a paragraph explaining that dopamine modulates reward prediction errors through mesolimbic pathways"
+
+**REVISE_RESEARCH** for everything else, including:
+- Vague commands with no prior context: "improve this", "make it better", "strengthen this"
+- Argument quality: "make more convincing", "strengthen the argument"
+- Any mention of adding new evidence, citations, literature, or sources
+- Adding new sections without detailed content instructions: "add a conclusion", "write an introduction", "add a limitations section", "insert an abstract" — the document alone rarely has enough information to write a substantive new section
+- When uncertain, prefer REVISE_RESEARCH
+
+# THINK THROUGH THESE QUESTIONS
+
+**1. Is the intent clear enough to act on?**
+A message like "find papers on cognitive load in e-learning" is clear — act on it. A message like "help" or "fix it" isn't — the user needs guidance before you can take useful action. Single words, greetings, capability questions, or nonsensical input all need a conversational response first. When you can't determine a specific action with confidence, RESPOND is always safe.
+
+**2. Does the request reference something that exists?**
+Users often use deictic references — "this paragraph", "those papers", "what you found". Check whether the referenced thing actually exists: Is there selected text? Are there papers with citation IDs in prior turns? Is there a document loaded? If the reference points to nothing, don't guess — route to RESPOND and clarify.
+    
+# DISAMBIGUATION SHORTCUTS
+
+When two routes seem equally valid:
+- Uncertain between RESEARCH and RESPOND → prefer RESEARCH (evidence-backed answers are always more credible than opinions)
+- Uncertain between REVISE_SIMPLE and REVISE_RESEARCH → prefer REVISE_RESEARCH (evidence makes text stronger)
+- Message combines research + editing ("find papers and add citations") → RESEARCH first (search must happen before revision)
+- Message is vague/unbounded ("fix everything", "make it perfect") → RESPOND (help user focus before taking action)
+- Question that needs evidence to answer ("is this unique?", "has this been done?", "is this novel?") → RESEARCH (the answer lives in the literature, not in the conversation)
+- Imperative creation command ("write…", "make a list…", "create a table…", "draft…") → REVISE_RESEARCH **only if the document has content**
+- User introduces a research topic and asks about approach, landscape, or methodology ("I want to look at X", "how would you approach X", "what are the pros/cons of X") → RESEARCH (the literature landscape is essential context — without it, the response is generic advice any LLM could produce)    
+    """,
 }
