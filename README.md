@@ -99,7 +99,6 @@ After consolidation, `src/build_final_text.py` computes `returned_final_text`. F
 Requirements:
 
 - Python 3.12
-- Access to the Writing Coach V2 source under `src/wc_src/`
 - Azure OpenAI credentials for synthesis and evaluation
 
 Install dependencies:
