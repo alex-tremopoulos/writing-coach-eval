@@ -29,6 +29,17 @@ from src.constants.route_constraints import ROUTE_CONSTRAINTS
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
+def _safe_format(template: str, **kwargs) -> str:
+    """Substitute only known {slot} placeholders, leaving all other braces intact.
+
+    Unlike ``str.format()``, this does not raise ``KeyError`` when the template
+    contains literal curly braces (e.g. JSON examples in prompt files).
+    """
+    for key, value in kwargs.items():
+        template = template.replace(f"{{{key}}}", str(value))
+    return template
+
+
 # ---------------------------------------------------------------------------
 # Low-level file loaders
 # ---------------------------------------------------------------------------
@@ -235,7 +246,8 @@ def build_generator_prompts(
     # System block has no dynamic slots
     system_prompt = system_template
 
-    user_prompt = user_template.format(
+    user_prompt = _safe_format(
+        user_template,
         user_command=user_query,
         input_text=input_text,
         metrics_definition=metrics_definition,
@@ -285,11 +297,13 @@ def build_judge_prompts(
 
     system_template, user_template = load_combined_prompt("rubrics_judge_prompt.txt")
 
-    system_prompt = system_template.format(
+    system_prompt = _safe_format(
+        system_template,
         meta_rubrics=meta_rubrics,
     )
-    user_prompt = user_template.format(
-        user_query=user_query,
+    user_prompt = _safe_format(
+        user_template,
+        user_command=user_query,
         input_text=input_text,
         output_text=output_text,
         rubrics=rubrics,

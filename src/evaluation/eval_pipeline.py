@@ -47,16 +47,23 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+# Suppress noisy third-party loggers
+logging.getLogger("langsmith").setLevel(logging.ERROR)
+logging.getLogger("langchain").setLevel(logging.WARNING)
 
 DEFAULT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_CONCURRENCY = 5
 MAX_RETRIES = 3  # passed to LangChain AzureChatOpenAI max_retries
+DEFAULT_INPUT = "final_data/all_results_with_final_text.csv"
 
+# Scalar summary columns written once per evaluated row
 EVAL_CSV_FIELDNAMES = [
     "row_id",
     "route",
+    "status",
+    "timestamp",
     "rubrics_count",
     "rubrics_passed",
     "rubrics_failed",
@@ -65,7 +72,11 @@ EVAL_CSV_FIELDNAMES = [
     "meta_rubrics_passed",
     "meta_rubrics_failed",
     "meta_score",
-    "status",
+    "overall_notes",
+    # Structured fields packed as valid JSON strings
+    "rubrics_json",    # generated rubrics array
+    "verdicts_json",   # judge evaluation array
+    "meta_verdicts_json",
 ]
 
 
@@ -280,12 +291,12 @@ def load_input_data(
     """Load and filter the input dataset.
 
     Args:
-        input_path: Path to the all_results.csv file.
+        input_path: Path to all_results_with_final_text.csv (must have returned_final_text).
         routes: Optional list of routes to filter by (e.g., ['RESEARCH', 'RESPOND']).
         limit: Optional max number of rows to process.
 
     Returns:
-        List of row dicts with keys: row_id, query, input, route_intended, output (parsed).
+        List of row dicts with keys: row_id, query, input, route, response_text.
     """
     df = pd.read_csv(input_path, encoding="utf-8-sig")
 
@@ -299,24 +310,11 @@ def load_input_data(
 
     if limit:
         df = df.head(limit)
-        logger.info("Limited to first %d rows", limit)
 
     rows = []
     for _, row in df.iterrows():
-        # Parse the output JSON column
-        output_data = {}
-        if pd.notna(row.get("output")):
-            try:
-                output_data = json.loads(row["output"])
-            except json.JSONDecodeError:
-                pass
-
-        # Extract the system's response text — try multiple sources
-        response_text = ""
-        if output_data.get("response"):
-            response_text = str(output_data["response"])
-        elif pd.notna(row.get("response")) and row.get("response"):
-            response_text = str(row["response"])
+        rt = row.get("returned_final_text")
+        response_text = str(rt) if pd.notna(rt) and rt else ""
 
         rows.append({
             "row_id": int(row["row_id"]),
@@ -324,7 +322,6 @@ def load_input_data(
             "input": str(row.get("input", "")),
             "route": str(row.get(route_col, "UNKNOWN")),
             "response_text": response_text,
-            "output_data": output_data,
         })
 
     logger.info("Loaded %d rows from %s", len(rows), input_path)
@@ -385,9 +382,9 @@ async def process_row(
 
     async with semaphore:
         try:
-            # ---- Stage 1: Generate Rubrics ----
-            logger.info("Row %d: Stage 1 — Generating rubrics (route=%s)", row_id, row["route"])
+            logger.info("Row %d: processing (route=%s)", row_id, row["route"])
 
+            # ---- Stage 1: Generate Rubrics ----
             gen_system, gen_user = build_generator_prompts(
                 user_query=row["query"],
                 input_text=row["input"],
@@ -405,7 +402,7 @@ async def process_row(
 
             gen_parsed = parse_json_response(gen_response)
             if gen_parsed is None:
-                logger.warning("Row %d: Failed to parse generator JSON response", row_id)
+                logger.warning("Row %d: Failed to parse generator response", row_id)
                 result["status"] = "GENERATOR_PARSE_ERROR"
                 return result
 
@@ -421,18 +418,16 @@ async def process_row(
 
             # Stop here if only Stage 1 was requested
             if generator_only:
-                logger.info("Row %d: Generator-only mode — skipping judge", row_id)
                 result["status"] = "GENERATOR_ONLY"
                 return result
 
             # Check if we have output text to judge
             if not row["response_text"]:
-                logger.warning("Row %d: No response text available to judge", row_id)
+                logger.warning("Row %d: No response text to judge", row_id)
                 result["status"] = "NO_OUTPUT_TEXT"
                 return result
 
             # ---- Stage 2: Judge Rubrics ----
-            logger.info("Row %d: Stage 2 — Judging %d rubrics", row_id, len(rubrics))
 
             rubrics_str = json.dumps(rubrics, indent=2, ensure_ascii=False)
 
@@ -454,20 +449,22 @@ async def process_row(
 
             judge_parsed = parse_json_response(judge_response)
             if judge_parsed is None:
-                logger.warning("Row %d: Failed to parse judge JSON response", row_id)
+                logger.warning("Row %d: Failed to parse judge response", row_id)
                 result["status"] = "JUDGE_PARSE_ERROR"
                 return result
 
-            # Process verdicts
-            verdicts = judge_parsed.get("verdicts", [])
-            result["verdicts"] = verdicts
-            result["overall_notes"] = judge_parsed.get("overall_notes", "")
+            # Process evaluation entries (score 1-4; >= 3 = Good/Excellent = passed)
+            evaluation = judge_parsed.get("evaluation", [])
+            result["verdicts"] = evaluation
+            result["overall_notes"] = (
+                judge_parsed.get("overall_assessment", {}).get("summary", "")
+            )
 
-            passed = sum(1 for v in verdicts if v.get("verdict", "").upper() == "MET")
-            failed = len(verdicts) - passed
+            passed = sum(1 for v in evaluation if v.get("score", 0) >= 3)
+            failed = len(evaluation) - passed
             result["rubrics_passed"] = passed
             result["rubrics_failed"] = failed
-            result["score"] = round(passed / len(verdicts), 4) if verdicts else 0.0
+            result["score"] = round(passed / len(evaluation), 4) if evaluation else 0.0
 
             # Process meta-verdicts
             meta_verdicts = judge_parsed.get("meta_verdicts", [])
@@ -482,14 +479,9 @@ async def process_row(
             )
 
             logger.info(
-                "Row %d: Score=%.2f (%d/%d passed), Meta=%.2f (%d/%d)",
-                row_id,
-                result["score"],
-                passed,
-                len(verdicts),
-                result["meta_score"],
-                meta_passed,
-                len(meta_verdicts),
+                "Row %d: done — score=%.2f (%d/%d), meta=%.2f (%d/%d)",
+                row_id, result["score"], passed, len(evaluation),
+                result["meta_score"], meta_passed, len(meta_verdicts),
             )
 
         except Exception as e:
@@ -529,10 +521,12 @@ class OutputWriter:
     async def write_result(self, result: dict[str, Any]) -> None:
         """Write one evaluation result to both CSV and JSONL."""
         async with self._lock:
-            # CSV — summary row
+            # CSV — scalar columns + structured fields as JSON strings
             self._csv_writer.writerow({
                 "row_id": result["row_id"],
                 "route": result["route"],
+                "status": result["status"],
+                "timestamp": result["timestamp"],
                 "rubrics_count": result["rubrics_count"],
                 "rubrics_passed": result["rubrics_passed"],
                 "rubrics_failed": result["rubrics_failed"],
@@ -541,7 +535,13 @@ class OutputWriter:
                 "meta_rubrics_passed": result["meta_rubrics_passed"],
                 "meta_rubrics_failed": result["meta_rubrics_failed"],
                 "meta_score": result["meta_score"],
-                "status": result["status"],
+                "overall_notes": result["overall_notes"],
+                "rubrics_json": json.dumps(result["rubrics"], ensure_ascii=False)
+                    if result["rubrics"] is not None else "",
+                "verdicts_json": json.dumps(result["verdicts"], ensure_ascii=False)
+                    if result["verdicts"] is not None else "",
+                "meta_verdicts_json": json.dumps(result["meta_verdicts"], ensure_ascii=False)
+                    if result["meta_verdicts"] is not None else "",
             })
             self._csv_file.flush()
 
@@ -688,28 +688,25 @@ def build_enriched_output(
     output_dir: Path,
     run_name: str,
 ) -> tuple[Path, Path] | None:
-    """Create enriched copies of all_results files with eval columns appended.
+    """Copy the evaluated rows from the input file and append eval result columns.
 
-    Reads the original input CSV, loads all evaluation results from the JSONL
-    (which may include results from previous resumed runs), merges by ``row_id``,
-    and writes two new files in the same output directory:
+    Reads ``all_results_with_final_text`` (the input), filters to only the rows
+    that were evaluated in this run, merges eval results by ``row_id``, and
+    writes two enriched files in ``output_dir``:
 
     - ``{run_name}_all_results_enriched.csv``
     - ``{run_name}_all_results_enriched.jsonl``
 
-    The original ``all_results.csv`` and ``all_results.jsonl`` in ``final_data/``
-    are never modified.
-
     Args:
-        input_path: Path to the original all_results.csv used as input.
-        details_jsonl: Path to the eval details JSONL (accumulates all runs).
+        input_path: Path to all_results_with_final_text.csv used as pipeline input.
+        details_jsonl: Path to the eval details JSONL for this run.
         output_dir: Directory where enriched files will be written.
         run_name: Run name prefix for output files.
 
     Returns:
         Tuple of (enriched_csv_path, enriched_jsonl_path), or None on failure.
     """
-    # Load all eval results indexed by row_id (from JSONL — includes resumed rows)
+    # Load eval results indexed by row_id
     eval_by_id: dict[int, dict] = {}
     if details_jsonl.exists():
         with open(details_jsonl, "r", encoding="utf-8") as f:
@@ -723,34 +720,24 @@ def build_enriched_output(
                         pass
 
     if not eval_by_id:
-        logger.warning(
-            "No eval results found in %s — skipping enriched output", details_jsonl
-        )
+        logger.warning("No eval results found in %s — skipping enriched output", details_jsonl)
         return None
 
-    # Load original CSV
+    # Load input CSV and keep only the rows that were evaluated
     df = pd.read_csv(input_path, encoding="utf-8-sig")
+    df = df[df["row_id"].isin(eval_by_id.keys())].copy()
+    df.reset_index(drop=True, inplace=True)
 
-    # New eval columns
-    eval_cols = [
-        "eval_status",
-        "eval_timestamp",
-        "eval_rubrics_count",
-        "eval_rubrics_passed",
-        "eval_rubrics_failed",
-        "eval_score",
-        "eval_meta_rubrics_count",
-        "eval_meta_rubrics_passed",
-        "eval_meta_rubrics_failed",
-        "eval_meta_score",
-        "eval_overall_notes",
-        "eval_rubrics",        # JSON string of generated rubric items
-        "eval_verdicts",       # JSON string of judge verdicts
-        "eval_meta_verdicts",  # JSON string of meta-rubric verdicts
-        "eval_generator_raw",  # Raw LLM text from Stage 1
-        "eval_judge_raw",      # Raw LLM text from Stage 2
+    # Append eval columns
+    eval_scalar_cols = [
+        "eval_status", "eval_timestamp",
+        "eval_rubrics_count", "eval_rubrics_passed", "eval_rubrics_failed", "eval_score",
+        "eval_meta_rubrics_count", "eval_meta_rubrics_passed", "eval_meta_rubrics_failed",
+        "eval_meta_score", "eval_overall_notes",
+        "eval_rubrics_json", "eval_verdicts_json", "eval_meta_verdicts_json",
+        "eval_generator_raw", "eval_judge_raw",
     ]
-    for col in eval_cols:
+    for col in eval_scalar_cols:
         df[col] = None
 
     def _to_json_str(val: Any) -> str | None:
@@ -760,12 +747,8 @@ def build_enriched_output(
             return val
         return json.dumps(val, ensure_ascii=False)
 
-    matched = 0
     for idx, row in df.iterrows():
-        rid = int(row["row_id"])
-        if rid not in eval_by_id:
-            continue
-        ev = eval_by_id[rid]
+        ev = eval_by_id[int(row["row_id"])]
         df.at[idx, "eval_status"] = ev.get("status")
         df.at[idx, "eval_timestamp"] = ev.get("timestamp")
         df.at[idx, "eval_rubrics_count"] = ev.get("rubrics_count", 0)
@@ -777,16 +760,13 @@ def build_enriched_output(
         df.at[idx, "eval_meta_rubrics_failed"] = ev.get("meta_rubrics_failed", 0)
         df.at[idx, "eval_meta_score"] = ev.get("meta_score", 0.0)
         df.at[idx, "eval_overall_notes"] = ev.get("overall_notes")
-        df.at[idx, "eval_rubrics"] = _to_json_str(ev.get("rubrics"))
-        df.at[idx, "eval_verdicts"] = _to_json_str(ev.get("verdicts"))
-        df.at[idx, "eval_meta_verdicts"] = _to_json_str(ev.get("meta_verdicts"))
+        df.at[idx, "eval_rubrics_json"] = _to_json_str(ev.get("rubrics"))
+        df.at[idx, "eval_verdicts_json"] = _to_json_str(ev.get("verdicts"))
+        df.at[idx, "eval_meta_verdicts_json"] = _to_json_str(ev.get("meta_verdicts"))
         df.at[idx, "eval_generator_raw"] = ev.get("generator_raw_response")
         df.at[idx, "eval_judge_raw"] = ev.get("judge_raw_response")
-        matched += 1
 
-    logger.info(
-        "Enriched output: %d/%d rows have eval data", matched, len(df)
-    )
+    logger.info("Enriched output: %d rows merged", len(df))
 
     enriched_csv = output_dir / f"{run_name}_all_results_enriched.csv"
     df.to_csv(enriched_csv, index=False, encoding="utf-8")
@@ -795,7 +775,16 @@ def build_enriched_output(
     enriched_jsonl = output_dir / f"{run_name}_all_results_enriched.jsonl"
     with open(enriched_jsonl, "w", encoding="utf-8") as f:
         for _, row in df.iterrows():
-            f.write(json.dumps(row.to_dict(), ensure_ascii=False, default=str) + "\n")
+            rec = row.to_dict()
+            # Parse the JSON string columns back into objects for the JSONL
+            for col in ("eval_rubrics_json", "eval_verdicts_json", "eval_meta_verdicts_json"):
+                v = rec.get(col)
+                if v and isinstance(v, str):
+                    try:
+                        rec[col] = json.loads(v)
+                    except json.JSONDecodeError:
+                        pass
+            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     logger.info("Enriched JSONL written: %s", enriched_jsonl)
 
     return enriched_csv, enriched_jsonl
@@ -878,8 +867,8 @@ def main():
     )
     parser.add_argument(
         "--input",
-        default="final_data/all_results.csv",
-        help="Path to input CSV with system outputs (default: final_data/all_results.csv)",
+        default=DEFAULT_INPUT,
+        help=f"Path to input CSV with system outputs (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--output-dir",
