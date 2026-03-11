@@ -5,3 +5,4 @@
 /extras
 **/__pycache__
 /data_outputs
+/eval_data
