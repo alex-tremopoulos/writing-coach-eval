@@ -56,7 +56,7 @@ DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_CONCURRENCY = 5
 MAX_RETRIES = 3  # passed to LangChain AzureChatOpenAI max_retries
-DEFAULT_INPUT = "final_data/all_results_with_final_text.csv"
+DEFAULT_INPUT = "final_data/all_results.csv"
 
 # Scalar summary columns written once per evaluated row
 EVAL_CSV_FIELDNAMES = [
@@ -290,13 +290,21 @@ def load_input_data(
 ) -> list[dict[str, Any]]:
     """Load and filter the input dataset.
 
+    Parses the ``output`` JSON column from all_results.csv to extract:
+    - ``response_text``: the ``output["response"]`` field — for RESPOND/RESEARCH this is
+      the full output to evaluate; for REVISE routes this is a short explanatory note
+      that accompanies the suggestions.
+    - ``suggestions``: list of revision suggestion dicts (original_text, transformed_text, explanation)
+    - ``has_suggestions``: True when at least one suggestion has a non-empty transformed_text
+
     Args:
-        input_path: Path to all_results_with_final_text.csv (must have returned_final_text).
+        input_path: Path to all_results.csv (must have an ``output`` JSON column).
         routes: Optional list of routes to filter by (e.g., ['RESEARCH', 'RESPOND']).
         limit: Optional max number of rows to process.
 
     Returns:
-        List of row dicts with keys: row_id, query, input, route, response_text.
+        List of row dicts with keys: row_id, query, input, route, response_text,
+        suggestions, has_suggestions.
     """
     df = pd.read_csv(input_path, encoding="utf-8-sig")
 
@@ -313,8 +321,23 @@ def load_input_data(
 
     rows = []
     for _, row in df.iterrows():
-        rt = row.get("returned_final_text")
-        response_text = str(rt) if pd.notna(rt) and rt else ""
+        # Parse the output JSON column
+        output_data: dict = {}
+        raw_output = row.get("output", "")
+        if pd.notna(raw_output) and raw_output:
+            try:
+                output_data = json.loads(str(raw_output))
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("Row %s: Failed to parse output JSON", row.get("row_id"))
+
+        response_text = str(output_data.get("response", "")).strip() if output_data else ""
+
+        # Keep only suggestions with a non-empty transformed_text
+        raw_suggestions = output_data.get("suggestions", []) if output_data else []
+        suggestions = [
+            s for s in (raw_suggestions or [])
+            if isinstance(s, dict) and (s.get("transformed_text") or "").strip()
+        ]
 
         rows.append({
             "row_id": int(row["row_id"]),
@@ -322,10 +345,68 @@ def load_input_data(
             "input": str(row.get("input", "")),
             "route": str(row.get(route_col, "UNKNOWN")),
             "response_text": response_text,
+            "suggestions": suggestions,
+            "has_suggestions": len(suggestions) > 0,
         })
 
     logger.info("Loaded %d rows from %s", len(rows), input_path)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Output formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_output_for_judge(response_text: str, suggestions: list[dict]) -> str:
+    """Format the writing coach output for the judge LLM.
+
+    For routes with no suggestions (RESPOND, RESEARCH), returns response_text directly —
+    it is the full output to be evaluated.
+    For routes with suggestions (REVISE_SIMPLE, REVISE_RESEARCH), returns a structured block
+    containing the brief response note followed by numbered suggestions.  Each suggestion
+    shows the original passage, the proposed revision, and an explanatory note.
+
+    Args:
+        response_text: The output["response"] field. This is the full response for
+            RESPOND/RESEARCH routes, or a short explanatory note for REVISE routes.
+        suggestions: List of suggestion dicts with keys: original_text, transformed_text,
+            explanation.  Only suggestions with a non-empty transformed_text are expected here.
+
+    Returns:
+        A formatted string suitable for the judge_prompt ``{output_text}`` slot.
+    """
+    if not suggestions:
+        return response_text
+
+    parts: list[str] = []
+
+    if response_text.strip():
+        parts.append("### Writing Coach Note\n" + response_text.strip())
+
+    parts.append(
+        f"### Revision Suggestions ({len(suggestions)} total)\n"
+        "Each suggestion shows the original passage and the proposed revision. "
+        "The user can accept or reject each suggestion independently."
+    )
+
+    for i, s in enumerate(suggestions, 1):
+        original = (s.get("original_text") or "").strip()
+        transformed = (s.get("transformed_text") or "").strip()
+        explanation = (s.get("explanation") or "").strip()
+
+        block_lines = [f"#### Suggestion {i}"]
+        if explanation:
+            block_lines.append(f"**Purpose**: {explanation}")
+        if original:
+            block_lines.append(f"**Original Text**:\n{original}")
+        else:
+            block_lines.append("**Original Text**: (insertion — no existing text is replaced)")
+        block_lines.append(f"**Proposed Revision**:\n{transformed}")
+
+        parts.append("\n".join(block_lines))
+
+    return "\n\n---\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -421,9 +502,9 @@ async def process_row(
                 result["status"] = "GENERATOR_ONLY"
                 return result
 
-            # Check if we have output text to judge
-            if not row["response_text"]:
-                logger.warning("Row %d: No response text to judge", row_id)
+            # Check if we have anything to judge
+            if not row["response_text"] and not row.get("has_suggestions"):
+                logger.warning("Row %d: No response text or suggestions to judge", row_id)
                 result["status"] = "NO_OUTPUT_TEXT"
                 return result
 
@@ -431,10 +512,17 @@ async def process_row(
 
             rubrics_str = json.dumps(rubrics, indent=2, ensure_ascii=False)
 
+            # Format output: plain text for RESPOND/RESEARCH, structured
+            # suggestions block for REVISE routes (detected by has_suggestions).
+            output_for_judge = _format_output_for_judge(
+                response_text=row["response_text"],
+                suggestions=row.get("suggestions", []),
+            )
+
             judge_system, judge_user = build_judge_prompts(
                 user_query=row["query"],
                 input_text=row["input"],
-                output_text=row["response_text"],
+                output_text=output_for_judge,
                 rubrics=rubrics_str,
             )
 
