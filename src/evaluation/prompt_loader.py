@@ -156,16 +156,22 @@ def load_route_prompt(route: str) -> str:
     key = route.upper()
     prompt_sections: list[str] = []
 
-    route_prompt = ROUTE_PROMPTS.get(key, "").strip()
-    if route_prompt and key != UNIVERSAL_ROUTE_PROMPT_KEY:
-        prompt_sections.append(f"The following are the system instructions for the {key} route:\n\n{route_prompt}")
-    elif key not in ROUTE_PROMPTS and key != UNIVERSAL_ROUTE_PROMPT_KEY:
-        prompt_sections.append(f"(No route prompt defined for route: {route})")
-
+    # First, include the shared universal instructions so they are truly prepended.
     universal_prompt = ROUTE_PROMPTS.get(UNIVERSAL_ROUTE_PROMPT_KEY, "").strip()
     if universal_prompt:
-        prompt_sections.append(f"The following are universal system instructions that apply across multiple routes:\n\n{universal_prompt}")
+        prompt_sections.append(
+            "The following are universal system instructions that apply across multiple routes:\n\n"
+            f"{universal_prompt}"
+        )
 
+    # Then include the route-specific prompt or a placeholder, skipping the UNIVERSAL pseudo-route itself.
+    route_prompt = ROUTE_PROMPTS.get(key, "").strip()
+    if route_prompt and key != UNIVERSAL_ROUTE_PROMPT_KEY:
+        prompt_sections.append(
+            f"The following are the system instructions for the {key} route:\n\n{route_prompt}"
+        )
+    elif key not in ROUTE_PROMPTS and key != UNIVERSAL_ROUTE_PROMPT_KEY:
+        prompt_sections.append(f"(No route prompt defined for route: {route})")
     if not prompt_sections:
         return f"(No route prompt defined for route: {route})"
 
