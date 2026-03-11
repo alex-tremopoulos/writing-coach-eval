@@ -81,7 +81,7 @@ REVISE_RESEARCH is used when:
 """,
 
     "UNIVERSAL": """\
-    # MINDSET & PRIORITIES
+# MINDSET & PRIORITIES
 Think like a helpful research writing mentor:
 1. **Bias toward action**: prefer RESEARCH when the user asks about evidence, literature, or claims. Prefer REVISE when they ask to change text. Use RESPOND only for discussion, synthesis, or questions about existing information.
 2. **Respect user intent**: if the user asks to "improve", "strengthen", or "fix" text, they want REVISE. If they say "find papers" or "what's known about", they want RESEARCH.
