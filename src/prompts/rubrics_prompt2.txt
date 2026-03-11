@@ -149,7 +149,7 @@ Use the route prompt to define:
 - route-specific constraints or priorities that should shape the rubrics
 
 # EXPECTED OUTPUT
-Generate a comprehensive rubrics in the following structured format:
+Generate comprehensive rubrics in the following structured format:
 
 ## Rubrics for: [Brief description of the task]
 **User Command**: [Restate the command]
