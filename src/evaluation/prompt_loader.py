@@ -260,7 +260,7 @@ def build_generator_prompts(
     if route_rubrics_constraints is None:
         route_rubrics_constraints = load_route_constraints(route)
 
-    system_template, user_template = load_combined_prompt("rubrics_prompt.txt")
+    system_template, user_template = load_combined_prompt("rubrics_prompt2.txt")
 
     # System block has no dynamic slots
     system_prompt = system_template

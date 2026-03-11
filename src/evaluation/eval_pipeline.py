@@ -64,20 +64,19 @@ EVAL_CSV_FIELDNAMES = [
     "route",
     "status",
     "timestamp",
-    "rubrics_count",
-    "rubrics_passed",
-    "rubrics_failed",
-    "score",
-    "meta_rubrics_count",
-    "meta_rubrics_passed",
-    "meta_rubrics_failed",
-    "meta_score",
+    "output_relevancy_score",
+    "completeness_score",
     "overall_notes",
     # Structured fields packed as valid JSON strings
     "rubrics_json",    # generated rubrics array
     "verdicts_json",   # judge evaluation array
     "meta_verdicts_json",
 ]
+
+METRIC_SCORE_FIELDS = {
+    "output relevancy": "output_relevancy_score",
+    "completeness": "completeness_score",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -179,30 +178,35 @@ def parse_json_response(text: str) -> dict | None:
 
 
 def parse_markdown_rubrics(text: str) -> dict | None:
-    """Parse the structured Markdown rubrics format produced by rubrics_prompt.txt.
+    """Parse the structured Markdown rubrics format produced by the generator.
 
-    Extracts ``### Criterion N: [Name]`` sections and their metadata into the
-    ``{"rubrics": [...]}`` structure expected by the pipeline.
+    Supports both the legacy ``### Criterion N: [Name]`` format and the newer
+    ``### Metric Rubric N: [Name]`` format. Returns the normalized
+    ``{"rubrics": [...]}`` structure expected by the rest of the pipeline.
 
     Returns None if the text does not look like rubrics Markdown.
     """
-    # Must have at least one criterion header to be considered rubrics Markdown
-    criterion_headers = re.findall(
-        r"###\s+Criterion\s+\d+:\s*(.+)", text, re.IGNORECASE
-    )
-    if not criterion_headers:
+    header_pattern = r"###\s+(?:Criterion|Metric Rubric)\s+\d+:\s*(.+)"
+
+    # Must have at least one rubric header to be considered rubrics Markdown
+    rubric_headers = re.findall(header_pattern, text, re.IGNORECASE)
+    if not rubric_headers:
         return None
 
     rubrics = []
-    # Split on criterion headers to process each block individually
-    blocks = re.split(r"(?=###\s+Criterion\s+\d+:)", text, flags=re.IGNORECASE)
+    # Split on rubric headers to process each block individually
+    blocks = re.split(
+        r"(?=###\s+(?:Criterion|Metric Rubric)\s+\d+:)",
+        text,
+        flags=re.IGNORECASE,
+    )
 
     for block in blocks:
-        header_match = re.match(r"###\s+Criterion\s+\d+:\s*(.+)", block, re.IGNORECASE)
+        header_match = re.match(header_pattern, block, re.IGNORECASE)
         if not header_match:
             continue
 
-        criterion_name = header_match.group(1).strip().strip("*")
+        rubric_name = header_match.group(1).strip().strip("*")
 
         description = ""
         desc_match = re.search(r"\*\*Description\*\*:\s*(.+?)(?=\n\*\*|\n###|$)", block, re.DOTALL)
@@ -215,19 +219,47 @@ def parse_markdown_rubrics(text: str) -> dict | None:
             linked_to = linked_match.group(1).strip()
 
         weight = ""
-        weight_match = re.search(r"\*\*Weight\*\*:\s*(.+)", block)
+        weight_match = re.search(r"\*\*(?:Weight|Metric Importance)\*\*:\s*(.+)", block)
         if weight_match:
             weight = weight_match.group(1).strip()
 
+        evaluation_items: list[dict[str, str]] = []
+        items_match = re.search(
+            r"\*\*Evaluation Items\*\*:\s*(.+?)(?=\n\|\s*Level\s*\||\n###|$)",
+            block,
+            re.DOTALL,
+        )
+        if items_match:
+            items_block = items_match.group(1)
+            for line in items_block.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("-"):
+                    continue
+
+                item_text = stripped[1:].strip()
+                item_importance = ""
+                importance_match = re.search(r"\(Importance:\s*([^)]+)\)\s*$", item_text)
+                if importance_match:
+                    item_importance = importance_match.group(1).strip()
+                    item_text = re.sub(r"\s*\(Importance:\s*[^)]+\)\s*$", "", item_text).strip()
+
+                evaluation_items.append({
+                    "item": item_text,
+                    "importance": item_importance,
+                })
+
         # Extract table rows: | Level | Score | Description | Indicators |
-        # Level cells may be bold-formatted: | **Excellent** |
+        # Level cells may be bold-formatted and use either the legacy 1-4
+        # labels or the newer metric-specific 0-2 labels.
         levels = []
         table_rows = re.findall(
-            r"\|\s*\*{0,2}(Excellent|Good|Fair|Poor)\*{0,2}\s*\|\s*(\d)\s*\|([^|]+)\|([^|]+)\|",
+            r"\|\s*\*{0,2}([^|]+?)\*{0,2}\s*\|\s*(\d+)\s*\|([^|]+)\|([^|]+)\|",
             block,
             re.IGNORECASE,
         )
         for level, score, desc, indicators in table_rows:
+            if level.strip().lower() == "level":
+                continue
             levels.append({
                 "level": level.strip(),
                 "score": int(score.strip()),
@@ -236,10 +268,11 @@ def parse_markdown_rubrics(text: str) -> dict | None:
             })
 
         rubrics.append({
-            "criterion": criterion_name,
+            "metric": rubric_name,
             "description": description,
             "linked_to": linked_to,
-            "weight": weight,
+            "metric_importance": weight,
+            "evaluation_items": evaluation_items,
             "levels": levels,
         })
 
@@ -254,8 +287,32 @@ def parse_markdown_rubrics(text: str) -> dict | None:
     if reasoning_match:
         reasoning = reasoning_match.group(1).strip()
 
-    logger.debug("parse_markdown_rubrics: extracted %d criteria", len(rubrics))
+    logger.debug("parse_markdown_rubrics: extracted %d rubrics", len(rubrics))
     return {"rubrics": rubrics, "reasoning": reasoning}
+
+
+def _normalize_metric_name(name: str | None) -> str:
+    """Normalize metric names for reliable matching across prompt outputs."""
+    if not name:
+        return ""
+    return re.sub(r"\s+", " ", name).strip().lower()
+
+
+def _extract_metric_scores(evaluation: list[dict[str, Any]]) -> dict[str, int | None]:
+    """Extract per-metric 0-2 scores from judge evaluation entries."""
+    scores = {field_name: None for field_name in METRIC_SCORE_FIELDS.values()}
+
+    for verdict in evaluation:
+        metric_name = verdict.get("metric_name") or verdict.get("criterion_name")
+        field_name = METRIC_SCORE_FIELDS.get(_normalize_metric_name(metric_name))
+        if field_name is None:
+            continue
+
+        score = verdict.get("score")
+        if isinstance(score, int):
+            scores[field_name] = score
+
+    return scores
 
 
 # ---------------------------------------------------------------------------
@@ -451,14 +508,8 @@ async def process_row(
         "meta_verdicts": None,
         "overall_notes": None,
         # Scores
-        "rubrics_count": 0,
-        "rubrics_passed": 0,
-        "rubrics_failed": 0,
-        "score": 0.0,
-        "meta_rubrics_count": 0,
-        "meta_rubrics_passed": 0,
-        "meta_rubrics_failed": 0,
-        "meta_score": 0.0,
+        "output_relevancy_score": None,
+        "completeness_score": None,
     }
 
     async with semaphore:
@@ -490,7 +541,6 @@ async def process_row(
             rubrics = gen_parsed.get("rubrics", [])
             result["rubrics"] = rubrics
             result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
-            result["rubrics_count"] = len(rubrics)
 
             if not rubrics:
                 logger.warning("Row %d: Generator produced zero rubrics", row_id)
@@ -541,35 +591,30 @@ async def process_row(
                 result["status"] = "JUDGE_PARSE_ERROR"
                 return result
 
-            # Process evaluation entries (score 1-4; >= 3 = Good/Excellent = passed)
+            # Process per-metric evaluation entries (score 0-2 per metric)
             evaluation = judge_parsed.get("evaluation", [])
             result["verdicts"] = evaluation
-            result["overall_notes"] = (
+            result["overall_notes"] = judge_parsed.get("summary") or (
                 judge_parsed.get("overall_assessment", {}).get("summary", "")
             )
 
-            passed = sum(1 for v in evaluation if v.get("score", 0) >= 3)
-            failed = len(evaluation) - passed
-            result["rubrics_passed"] = passed
-            result["rubrics_failed"] = failed
-            result["score"] = round(passed / len(evaluation), 4) if evaluation else 0.0
+            metric_scores = _extract_metric_scores(evaluation)
+            result.update(metric_scores)
+
+            if any(score is None for score in metric_scores.values()):
+                logger.warning("Row %d: Judge response missing one or more metric scores", row_id)
+                result["status"] = "JUDGE_INCOMPLETE"
+                return result
 
             # Process meta-verdicts
             meta_verdicts = judge_parsed.get("meta_verdicts", [])
             result["meta_verdicts"] = meta_verdicts
-            result["meta_rubrics_count"] = len(meta_verdicts)
-
-            meta_passed = sum(1 for v in meta_verdicts if v.get("verdict", "").upper() == "MET")
-            result["meta_rubrics_passed"] = meta_passed
-            result["meta_rubrics_failed"] = len(meta_verdicts) - meta_passed
-            result["meta_score"] = (
-                round(meta_passed / len(meta_verdicts), 4) if meta_verdicts else 0.0
-            )
 
             logger.info(
-                "Row %d: done — score=%.2f (%d/%d), meta=%.2f (%d/%d)",
-                row_id, result["score"], passed, len(evaluation),
-                result["meta_score"], meta_passed, len(meta_verdicts),
+                "Row %d: done — Output Relevancy=%s, Completeness=%s",
+                row_id,
+                result["output_relevancy_score"],
+                result["completeness_score"],
             )
 
         except Exception as e:
@@ -615,14 +660,8 @@ class OutputWriter:
                 "route": result["route"],
                 "status": result["status"],
                 "timestamp": result["timestamp"],
-                "rubrics_count": result["rubrics_count"],
-                "rubrics_passed": result["rubrics_passed"],
-                "rubrics_failed": result["rubrics_failed"],
-                "score": result["score"],
-                "meta_rubrics_count": result["meta_rubrics_count"],
-                "meta_rubrics_passed": result["meta_rubrics_passed"],
-                "meta_rubrics_failed": result["meta_rubrics_failed"],
-                "meta_score": result["meta_score"],
+                "output_relevancy_score": result["output_relevancy_score"],
+                "completeness_score": result["completeness_score"],
                 "overall_notes": result["overall_notes"],
                 "rubrics_json": json.dumps(result["rubrics"], ensure_ascii=False)
                     if result["rubrics"] is not None else "",
@@ -819,9 +858,7 @@ def build_enriched_output(
     # Append eval columns
     eval_scalar_cols = [
         "eval_status", "eval_timestamp",
-        "eval_rubrics_count", "eval_rubrics_passed", "eval_rubrics_failed", "eval_score",
-        "eval_meta_rubrics_count", "eval_meta_rubrics_passed", "eval_meta_rubrics_failed",
-        "eval_meta_score", "eval_overall_notes",
+        "eval_output_relevancy_score", "eval_completeness_score", "eval_overall_notes",
         "eval_rubrics_json", "eval_verdicts_json", "eval_meta_verdicts_json",
         "eval_generator_raw", "eval_judge_raw",
     ]
@@ -839,14 +876,8 @@ def build_enriched_output(
         ev = eval_by_id[int(row["row_id"])]
         df.at[idx, "eval_status"] = ev.get("status")
         df.at[idx, "eval_timestamp"] = ev.get("timestamp")
-        df.at[idx, "eval_rubrics_count"] = ev.get("rubrics_count", 0)
-        df.at[idx, "eval_rubrics_passed"] = ev.get("rubrics_passed", 0)
-        df.at[idx, "eval_rubrics_failed"] = ev.get("rubrics_failed", 0)
-        df.at[idx, "eval_score"] = ev.get("score", 0.0)
-        df.at[idx, "eval_meta_rubrics_count"] = ev.get("meta_rubrics_count", 0)
-        df.at[idx, "eval_meta_rubrics_passed"] = ev.get("meta_rubrics_passed", 0)
-        df.at[idx, "eval_meta_rubrics_failed"] = ev.get("meta_rubrics_failed", 0)
-        df.at[idx, "eval_meta_score"] = ev.get("meta_score", 0.0)
+        df.at[idx, "eval_output_relevancy_score"] = ev.get("output_relevancy_score")
+        df.at[idx, "eval_completeness_score"] = ev.get("completeness_score")
         df.at[idx, "eval_overall_notes"] = ev.get("overall_notes")
         df.at[idx, "eval_rubrics_json"] = _to_json_str(ev.get("rubrics"))
         df.at[idx, "eval_verdicts_json"] = _to_json_str(ev.get("verdicts"))
@@ -905,19 +936,26 @@ def _print_summary(
     if ok_results:
         print()
         print("Scores by route:")
-        route_scores: dict[str, list[float]] = {}
+        route_scores: dict[str, dict[str, list[int]]] = {}
         for r in ok_results:
-            route_scores.setdefault(r["route"], []).append(r["score"])
+            route_bucket = route_scores.setdefault(
+                r["route"],
+                {"output_relevancy_score": [], "completeness_score": []},
+            )
+            if r.get("output_relevancy_score") is not None:
+                route_bucket["output_relevancy_score"].append(r["output_relevancy_score"])
+            if r.get("completeness_score") is not None:
+                route_bucket["completeness_score"].append(r["completeness_score"])
 
         for route in sorted(route_scores):
-            scores = route_scores[route]
-            avg_score = sum(scores) / len(scores)
-            print(f"  {route:20} avg={avg_score:.3f}  n={len(scores)}")
-
-        # Overall
-        all_scores = [r["score"] for r in ok_results]
-        overall_avg = sum(all_scores) / len(all_scores)
-        print(f"  {'OVERALL':20} avg={overall_avg:.3f}  n={len(all_scores)}")
+            relevancy_scores = route_scores[route]["output_relevancy_score"]
+            completeness_scores = route_scores[route]["completeness_score"]
+            relevancy_avg = sum(relevancy_scores) / len(relevancy_scores) if relevancy_scores else float("nan")
+            completeness_avg = sum(completeness_scores) / len(completeness_scores) if completeness_scores else float("nan")
+            print(
+                f"  {route:20} Output Relevancy={relevancy_avg:.3f}  "
+                f"Completeness={completeness_avg:.3f}  n={len(relevancy_scores)}"
+            )
 
     print()
     print(f"Outputs saved:")
