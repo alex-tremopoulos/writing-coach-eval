@@ -30,7 +30,12 @@ from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from src.evaluation.prompt_loader import build_generator_prompts, build_judge_prompts
+from src.evaluation.prompt_loader import (
+    build_generator_prompts,
+    build_judge_prompts,
+    format_metrics_definition,
+)
+from src.constants.metrics_definitions import METRICS_DEFINITION
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -238,10 +243,12 @@ def parse_markdown_rubrics(text: str) -> dict | None:
 
                 item_text = stripped[1:].strip()
                 item_importance = ""
-                importance_match = re.search(r"\(Importance:\s*([^)]+)\)\s*$", item_text)
+                # Extract importance: handles patterns like "(Importance: High)", "(Importance: High).", etc.
+                importance_match = re.search(r"\(Importance:\s*([^)]+)\)", item_text)
                 if importance_match:
                     item_importance = importance_match.group(1).strip()
-                    item_text = re.sub(r"\s*\(Importance:\s*[^)]+\)\s*$", "", item_text).strip()
+                    # Remove the "(Importance: ...)" pattern and any trailing punctuation
+                    item_text = re.sub(r"\s*\(Importance:\s*[^)]+\)[.,;:]?\s*$", "", item_text).strip()
 
                 evaluation_items.append({
                     "item": item_text,
@@ -344,6 +351,7 @@ def load_input_data(
     input_path: str,
     routes: list[str] | None = None,
     limit: int | None = None,
+    route_column: str = "intended",
 ) -> list[dict[str, Any]]:
     """Load and filter the input dataset.
 
@@ -358,6 +366,9 @@ def load_input_data(
         input_path: Path to all_results.csv (must have an ``output`` JSON column).
         routes: Optional list of routes to filter by (e.g., ['RESEARCH', 'RESPOND']).
         limit: Optional max number of rows to process.
+        route_column: Which route column to use: ``'intended'`` (default) for ``route_intended``,
+            or ``'orchestrator'`` for ``route_orch``. If the selected column is missing,
+            falls back to the other column.
 
     Returns:
         List of row dicts with keys: row_id, query, input, route, response_text,
@@ -365,8 +376,23 @@ def load_input_data(
     """
     df = pd.read_csv(input_path, encoding="utf-8-sig")
 
-    # Use route_intended as the gold route (fallback to route_orch if missing)
-    route_col = "route_intended" if "route_intended" in df.columns else "route_orch"
+    # Determine which route column to use
+    if route_column == "intended":
+        preferred_col = "route_intended"
+        fallback_col = "route_orch"
+    else:  # orchestrator
+        preferred_col = "route_orch"
+        fallback_col = "route_intended"
+
+    # Use preferred column if present, otherwise fall back
+    if preferred_col in df.columns:
+        route_col = preferred_col
+    elif fallback_col in df.columns:
+        logger.info("Preferred column '%s' not found, falling back to '%s'", preferred_col, fallback_col)
+        route_col = fallback_col
+    else:
+        logger.error("Neither '%s' nor '%s' column found in input CSV", preferred_col, fallback_col)
+        return []
 
     if routes:
         routes_upper = [r.upper() for r in routes]
@@ -478,6 +504,7 @@ async def process_row(
     max_tokens: int,
     semaphore: asyncio.Semaphore,
     generator_only: bool = False,
+    rubrics_mode: str = "combined",
 ) -> dict[str, Any]:
     """Run Stage 1 (generate rubrics) and optionally Stage 2 (judge rubrics) for one row.
 
@@ -488,6 +515,10 @@ async def process_row(
         max_tokens: Max tokens per LLM call.
         semaphore: Concurrency limiter.
         generator_only: If True, stop after Stage 1 and skip the judge.
+        rubrics_mode: ``'combined'`` uses a single LLM call with rubrics_prompt2.txt
+            (both metrics together). ``'split'`` makes two separate LLM calls — one
+            per metric — using the metric-specific prompt files, then merges the
+            resulting rubrics before judging.
 
     Returns:
         Dict with full evaluation results for this row.
@@ -517,30 +548,88 @@ async def process_row(
             logger.info("Row %d: processing (route=%s)", row_id, row["route"])
 
             # ---- Stage 1: Generate Rubrics ----
-            gen_system, gen_user = build_generator_prompts(
-                user_query=row["query"],
-                input_text=row["input"],
-                route=row["route"],
-            )
+            if rubrics_mode == "split":
+                # Two separate LLM calls, one per metric, then merge rubrics.
+                or_metrics_def = format_metrics_definition(
+                    {k: v for k, v in METRICS_DEFINITION.items() if k == "Output Relevancy"}
+                )
+                c_metrics_def = format_metrics_definition(
+                    {k: v for k, v in METRICS_DEFINITION.items() if k == "Completeness"}
+                )
 
-            gen_response = await call_llm(
-                deployment=deployment,
-                system_prompt=gen_system,
-                user_prompt=gen_user,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            result["generator_raw_response"] = gen_response
+                gen_system_or, gen_user_or = build_generator_prompts(
+                    user_query=row["query"],
+                    input_text=row["input"],
+                    route=row["route"],
+                    metrics_definition=or_metrics_def,
+                    prompt_file="rubrics_prompt_output_relevancy.txt",
+                )
+                gen_system_c, gen_user_c = build_generator_prompts(
+                    user_query=row["query"],
+                    input_text=row["input"],
+                    route=row["route"],
+                    metrics_definition=c_metrics_def,
+                    prompt_file="rubrics_prompt_completeness.txt",
+                )
 
-            gen_parsed = parse_json_response(gen_response)
-            if gen_parsed is None:
-                logger.warning("Row %d: Failed to parse generator response", row_id)
-                result["status"] = "GENERATOR_PARSE_ERROR"
-                return result
+                gen_response_or, gen_response_c = await asyncio.gather(
+                    call_llm(deployment, gen_system_or, gen_user_or, temperature, max_tokens),
+                    call_llm(deployment, gen_system_c, gen_user_c, temperature, max_tokens),
+                )
+                result["generator_raw_response"] = json.dumps(
+                    {"output_relevancy": gen_response_or, "completeness": gen_response_c},
+                    ensure_ascii=False,
+                )
 
-            rubrics = gen_parsed.get("rubrics", [])
+                gen_parsed_or = parse_json_response(gen_response_or)
+                gen_parsed_c  = parse_json_response(gen_response_c)
+
+                if gen_parsed_or is None:
+                    logger.warning("Row %d: Failed to parse generator response (Output Relevancy)", row_id)
+                    result["status"] = "GENERATOR_PARSE_ERROR"
+                    return result
+                if gen_parsed_c is None:
+                    logger.warning("Row %d: Failed to parse generator response (Completeness)", row_id)
+                    result["status"] = "GENERATOR_PARSE_ERROR"
+                    return result
+
+                rubrics = (
+                    gen_parsed_or.get("rubrics", [])
+                    + gen_parsed_c.get("rubrics", [])
+                )
+                result["rubrics_reasoning"] = json.dumps(
+                    {
+                        "output_relevancy": gen_parsed_or.get("reasoning", ""),
+                        "completeness": gen_parsed_c.get("reasoning", ""),
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                # combined mode: single LLM call with both metrics
+                gen_system, gen_user = build_generator_prompts(
+                    user_query=row["query"],
+                    input_text=row["input"],
+                    route=row["route"],
+                )
+                gen_response = await call_llm(
+                    deployment=deployment,
+                    system_prompt=gen_system,
+                    user_prompt=gen_user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                result["generator_raw_response"] = gen_response
+
+                gen_parsed = parse_json_response(gen_response)
+                if gen_parsed is None:
+                    logger.warning("Row %d: Failed to parse generator response", row_id)
+                    result["status"] = "GENERATOR_PARSE_ERROR"
+                    return result
+
+                rubrics = gen_parsed.get("rubrics", [])
+                result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
+
             result["rubrics"] = rubrics
-            result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
 
             if not rubrics:
                 logger.warning("Row %d: Generator produced zero rubrics", row_id)
@@ -707,6 +796,8 @@ async def run_pipeline(
     resume: bool = True,
     run_name: str | None = None,
     generator_only: bool = False,
+    rubrics_mode: str = "combined",
+    route_column: str = "intended",
 ) -> None:
     """Run the full dynamic rubrics evaluation pipeline.
 
@@ -723,6 +814,12 @@ async def run_pipeline(
         run_name: Optional name for output files. Defaults to timestamp-based name.
         generator_only: If True, run only Stage 1 (rubrics generation) and skip
             the judge. Useful for testing or inspecting generated rubrics.
+        rubrics_mode: ``'combined'`` (default) uses a single generator LLM call
+            with both metrics in one prompt.  ``'split'`` makes two parallel calls,
+            one per metric, using the metric-specific prompt files, then merges the
+            rubrics before judging.
+        route_column: Which route column to use: ``'intended'`` (default) for
+            ``route_intended``, or ``'orchestrator'`` for ``route_orch``.
     """
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -739,10 +836,12 @@ async def run_pipeline(
     logger.info("Run name:    %s", run_name)
     if generator_only:
         logger.info("Mode:        GENERATOR ONLY (Stage 1, no judge)")
+    logger.info("Rubrics mode: %s", rubrics_mode)
+    logger.info("Route column: %s", route_column)
     logger.info("=" * 80)
 
     # Load data
-    rows = load_input_data(input_path, routes=routes, limit=limit)
+    rows = load_input_data(input_path, routes=routes, limit=limit, route_column=route_column)
     if not rows:
         logger.warning("No rows to process. Exiting.")
         return
@@ -775,6 +874,7 @@ async def run_pipeline(
         result = await process_row(
             row, deployment, temperature, max_tokens, semaphore,
             generator_only=generator_only,
+            rubrics_mode=rubrics_mode,
         )
         await writer.write_result(result)
         return result
@@ -932,6 +1032,8 @@ def _print_summary(
         print(f"  {status:30} {count:4}")
 
     # Score summary by route
+    import statistics
+
     ok_results = [r for r in results if r["status"] == "OK"]
     if ok_results:
         print()
@@ -952,9 +1054,11 @@ def _print_summary(
             completeness_scores = route_scores[route]["completeness_score"]
             relevancy_avg = sum(relevancy_scores) / len(relevancy_scores) if relevancy_scores else float("nan")
             completeness_avg = sum(completeness_scores) / len(completeness_scores) if completeness_scores else float("nan")
+            relevancy_std = statistics.stdev(relevancy_scores) if len(relevancy_scores) >= 2 else 0.0
+            completeness_std = statistics.stdev(completeness_scores) if len(completeness_scores) >= 2 else 0.0
             print(
-                f"  {route:20} Output Relevancy={relevancy_avg:.3f}  "
-                f"Completeness={completeness_avg:.3f}  n={len(relevancy_scores)}"
+                f"  {route:20} Output Relevancy={relevancy_avg:.3f} (±{relevancy_std:.3f})  "
+                f"Completeness={completeness_avg:.3f} (±{completeness_std:.3f})  n={len(relevancy_scores)}"
             )
 
     print()
@@ -1047,6 +1151,27 @@ def main():
         help="Run Stage 1 only (rubrics generation) — skip the judge. Useful for testing.",
     )
     parser.add_argument(
+        "--rubrics-mode",
+        choices=["combined", "split"],
+        default="combined",
+        help=(
+            "How to run the rubrics generator. "
+            "'combined' (default): single LLM call with both metrics in one prompt (rubrics_prompt2.txt). "
+            "'split': two parallel LLM calls, one per metric, using the metric-specific prompt files."
+        ),
+    )
+    parser.add_argument(
+        "--route-column",
+        choices=["intended", "orchestrator"],
+        default="intended",
+        help=(
+            "Which route column to use from the input CSV. "
+            "'intended' (default): use route_intended (the ground truth route). "
+            "'orchestrator': use route_orch (the orchestrator's predicted route). "
+            "Falls back to the other column if the preferred one is missing."
+        ),
+    )
+    parser.add_argument(
         "--run-name",
         default=None,
         help="Name for output files (default: eval_YYYYMMDD_HHMMSS)",
@@ -1067,6 +1192,8 @@ def main():
             resume=not args.no_resume,
             run_name=args.run_name,
             generator_only=args.generator_only,
+            rubrics_mode=args.rubrics_mode,
+            route_column=args.route_column,
         )
     )
 
