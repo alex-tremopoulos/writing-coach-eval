@@ -16,6 +16,7 @@ inside a single file::
 
 Route prompts and constraints are imported from ``src/constants/`` Python dicts
 rather than individual `.txt` files, enabling version control and code-level editing.
+Route prompts may include a shared ``UNIVERSAL`` block plus a route-specific block.
 """
 
 from pathlib import Path
@@ -27,6 +28,7 @@ from src.constants.route_constraints import ROUTE_CONSTRAINTS
 
 # src/prompts/ — one level above src/evaluation/
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+UNIVERSAL_ROUTE_PROMPT_KEY = "UNIVERSAL"
 
 
 def _safe_format(template: str, **kwargs) -> str:
@@ -141,17 +143,39 @@ def load_route_prompt(route: str) -> str:
     """Return the orchestrator prompt section for a specific route.
 
     Loaded from the ``ROUTE_PROMPTS`` dict in ``src/constants/route_prompts.py``.
+    If present, the shared ``UNIVERSAL`` block is prepended to the route-specific
+    block so the generator sees both general routing guidance and route details.
 
     Args:
         route: Route name (e.g., 'RESEARCH', 'RESPOND', 'REVISE_SIMPLE', 'REVISE_RESEARCH').
 
     Returns:
-        Route prompt string, or a placeholder if the route is not defined.
+        Combined route prompt string, or a placeholder if neither the universal
+        nor route-specific prompt is defined.
     """
     key = route.upper()
-    if key not in ROUTE_PROMPTS:
+    prompt_sections: list[str] = []
+
+    # First, include the shared universal instructions so they are truly prepended.
+    universal_prompt = ROUTE_PROMPTS.get(UNIVERSAL_ROUTE_PROMPT_KEY, "").strip()
+    if universal_prompt:
+        prompt_sections.append(
+            "The following are universal system instructions that apply across multiple routes:\n\n"
+            f"{universal_prompt}"
+        )
+
+    # Then include the route-specific prompt or a placeholder, skipping the UNIVERSAL pseudo-route itself.
+    route_prompt = ROUTE_PROMPTS.get(key, "").strip()
+    if route_prompt and key != UNIVERSAL_ROUTE_PROMPT_KEY:
+        prompt_sections.append(
+            f"The following are the system instructions for the {key} route:\n\n{route_prompt}"
+        )
+    elif key not in ROUTE_PROMPTS and key != UNIVERSAL_ROUTE_PROMPT_KEY:
+        prompt_sections.append(f"(No route prompt defined for route: {route})")
+    if not prompt_sections:
         return f"(No route prompt defined for route: {route})"
-    return ROUTE_PROMPTS[key]
+
+    return "\n\n".join(prompt_sections)
 
 
 def load_route_constraints(route: str) -> str:
@@ -223,7 +247,8 @@ def build_generator_prompts(
         metrics_definition: Override string for the ``{metrics_definition}`` slot.
             If None, formatted from ``METRICS_DEFINITION`` in constants.
         route_prompt: Override string for the ``{route_prompt}`` slot.
-            If None, loaded from ``ROUTE_PROMPTS[route]`` in constants.
+            If None, loaded from the shared ``ROUTE_PROMPTS['UNIVERSAL']`` block
+            plus ``ROUTE_PROMPTS[route]`` when available.
         route_rubrics_constraints: Override for route constraints (loaded from
             ``ROUTE_CONSTRAINTS[route]`` if None). Reserved for future use when
             the rubrics prompt template includes a ``{route_rubrics_constraints}`` slot.
@@ -241,7 +266,7 @@ def build_generator_prompts(
     if route_rubrics_constraints is None:
         route_rubrics_constraints = load_route_constraints(route)
 
-    system_template, user_template = load_combined_prompt("rubrics_prompt.txt")
+    system_template, user_template = load_combined_prompt("rubrics_prompt2.txt")
 
     # System block has no dynamic slots
     system_prompt = system_template
