@@ -205,6 +205,7 @@ Return only the completed rubrics. Do not add prefatory text, analysis, or comme
 - Never evaluate hypothetical edits that are not grounded in the input text, user command, or route prompt
 - Never include expectations that exceed the selected route's capabilities
 - Never output chain-of-thought, planning notes, or extra explanation outside the requested rubrics
+- **Citation Evaluation Exclusion**: Do not create evaluation items that require accessing or verifying the content of the actual cited papers. The evaluation pipeline cannot retrieve or read referenced papers, so any rubric item that checks whether a citation accurately supports a specific claim or whether a cited paper is appropriate for the context must be excluded. Citation-presence items (e.g., "does the output include at least one citation?") are permissible only if they do not require inspecting paper content.
 
 # RUBRICS GENERATION RULES
 
