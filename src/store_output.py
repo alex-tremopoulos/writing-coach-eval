@@ -149,7 +149,7 @@ def run_query(row_id: int, query: str, document_text: str) -> Dict[str, Any]:
 
 
 CSV_FIELDNAMES = [
-    'row_id', 'query', 'input_preview', 'input_text', 'route', 'intent', 'reasoning',
+    'row_id', 'query', 'input_preview', 'input', 'route', 'intent', 'reasoning',
     'response_length', 'suggestions_count', 'references_count',
     'papers_count', 'segments_count', 'tools_used'
 ]
