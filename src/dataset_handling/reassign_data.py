@@ -344,6 +344,24 @@ def main() -> None:
                   f"folder={r['folder_source']}, "
                   f"query={str(r['query'])[:60]}")
 
+    # ---- 4c. For extra200kiwi: override route_intended from ref CSV ---------
+    kiwi_mask = combined["folder_source"] == "extra200kiwi"
+    if kiwi_mask.any() and "route" in ref_df.columns:
+        # Strip whitespace from queries on both sides to handle minor mismatches
+        kiwi_route_map = {str(q).strip(): r for q, r in zip(ref_df["query"], ref_df["route"])}
+        kiwi_intended = combined.loc[kiwi_mask, "query"].map(
+            lambda q: kiwi_route_map.get(str(q).strip())
+        )
+        matched = kiwi_intended.notna()
+        combined.loc[kiwi_mask & matched, "route_intended"] = kiwi_intended[matched]
+        print(f"\n  extra200kiwi route_intended set from ref CSV: "
+              f"{matched.sum()} / {kiwi_mask.sum()} rows")
+        if (~matched).any():
+            unmatched = combined.loc[kiwi_mask & ~matched, "query"]
+            print("  [WARN] Unmatched extra200kiwi queries for route_intended:")
+            for q in unmatched:
+                print(f"    {str(q)[:80]}")
+
     # ---- 5. Build 'output' column ------------------------------------------
     combined["output"] = combined.apply(
         lambda row: json.dumps(build_output_dict(row), ensure_ascii=False),
@@ -398,6 +416,17 @@ def main() -> None:
         rec["output"] = json.loads(rec["output"])   # un-stringify for JSONL
         records.append(rec)
     write_jsonl(records, jsonl_path, append=args.append)
+
+    # ---- 8b. Write kiwi-specific output files (extra200kiwi rows only) -----
+    kiwi_final = final[final["folder_source"] == "extra200kiwi"]
+    if not kiwi_final.empty:
+        write_csv(kiwi_final, OUTPUT_DIR / "kiwi_extra_results.csv", append=args.append)
+        kiwi_records = []
+        for _, row in kiwi_final.iterrows():
+            rec = row.to_dict()
+            rec["output"] = json.loads(rec["output"])
+            kiwi_records.append(rec)
+        write_jsonl(kiwi_records, OUTPUT_DIR / "kiwi_extra_results.jsonl", append=args.append)
 
     # ---- 9. Summary ---------------------------------------------------------
     print("\n" + "=" * 60)
