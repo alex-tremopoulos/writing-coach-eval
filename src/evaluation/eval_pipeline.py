@@ -1246,8 +1246,10 @@ def _log_to_mlflow(
                 mlflow.log_artifact(str(path), artifact_path="results")
 
         # ---- Cleanup local files (only after successful upload) ----
+        # Note: keep `details_jsonl` locally to support pipeline resume and debugging.
+        cleanup_paths = [results_csv, *(enriched_paths or [])]
         if not save_local:
-            for path in artifact_paths:
+            for path in cleanup_paths:
                 if path and Path(path).exists():
                     try:
                         Path(path).unlink()
