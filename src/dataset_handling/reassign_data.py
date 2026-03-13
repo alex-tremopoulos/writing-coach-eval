@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 INPUT_BASE = ROOT / "data_outputs" / "whole_input"
 OUTPUT_DIR = ROOT / "final_data"
 REF_CSV = ROOT / "data" / "data_routes_expanded.csv"
+KIWI_REF_CSV = ROOT / "data" / "data_routes_kiwi_selected167.csv"
 
 SOURCE_FOLDERS = [
     "extra10",
@@ -345,23 +346,31 @@ def main() -> None:
                   f"folder={r['folder_source']}, "
                   f"query={str(r['query'])[:60]}")
 
-    # ---- 4c. For extra167kiwi: override route_intended from ref CSV ---------
+    # ---- 4c. For extra167kiwi: set route_intended from kiwi reference CSV ----
+    # Rules:
+    #   - Queries marked RESPOND in the ref CSV → route_intended = RESPOND
+    #   - row_id 76 (REVISE_SIMPLE in orchestrator) → route_intended = REVISE_RESEARCH
+    #   - All other rows → route_intended = route_orch (already set above)
     kiwi_mask = combined["folder_source"] == "extra167kiwi"
-    if kiwi_mask.any() and "route" in ref_df.columns:
-        # Strip whitespace from queries on both sides to handle minor mismatches
-        kiwi_route_map = {str(q).strip(): r for q, r in zip(ref_df["query"], ref_df["route"])}
-        kiwi_intended = combined.loc[kiwi_mask, "query"].map(
-            lambda q: kiwi_route_map.get(str(q).strip())
+    if kiwi_mask.any():
+        kiwi_ref_df = pd.read_csv(KIWI_REF_CSV)
+
+        # Collect queries that should be RESPOND according to the ref CSV
+        respond_queries = set(
+            kiwi_ref_df.loc[kiwi_ref_df["route"] == "RESPOND", "query"].str.strip()
         )
-        matched = kiwi_intended.notna()
-        combined.loc[kiwi_mask & matched, "route_intended"] = kiwi_intended[matched]
-        print(f"\n  extra167kiwi route_intended set from ref CSV: "
-              f"{matched.sum()} / {kiwi_mask.sum()} rows")
-        if (~matched).any():
-            unmatched = combined.loc[kiwi_mask & ~matched, "query"]
-            print("  [WARN] Unmatched extra167kiwi queries for route_intended:")
-            for q in unmatched:
-                print(f"    {str(q)[:80]}")
+        respond_mask = kiwi_mask & combined["query"].str.strip().isin(respond_queries)
+        combined.loc[respond_mask, "route_intended"] = "RESPOND"
+
+        # Manual override: row_id 76 → REVISE_RESEARCH
+        row76_mask = kiwi_mask & (combined["row_id_previous_folder"] == 76)
+        combined.loc[row76_mask, "route_intended"] = "REVISE_RESEARCH"
+
+        print(f"\n  extra167kiwi route_intended:")
+        print(f"    RESPOND overrides from ref CSV : {respond_mask.sum()}")
+        print(f"    REVISE_RESEARCH override (row 76): {int(row76_mask.sum())}")
+        print(f"    Remaining use route_orch       : "
+              f"{kiwi_mask.sum() - respond_mask.sum() - int(row76_mask.sum())}")
 
     # ---- 5. Build 'output' column ------------------------------------------
     combined["output"] = combined.apply(
