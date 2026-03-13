@@ -226,11 +226,14 @@ def build_generator_prompts(
     metrics_definition: str | None = None,
     route_prompt: str | None = None,
     route_rubrics_constraints: str | None = None,
+    prompt_file: str = "rubrics_prompt2.txt",
 ) -> Tuple[str, str]:
     """Build system and user prompts for the rubrics generator LLM.
 
-    Loads ``src/prompts/rubrics_prompt.txt`` (block format) and fills in all
-    dynamic slots.
+    Loads the specified generator prompt file (block format) from ``src/prompts/``
+    and fills in all dynamic slots.  Defaults to ``rubrics_prompt2.txt`` (combined,
+    both metrics).  Pass ``rubrics_prompt_output_relevancy.txt`` or
+    ``rubrics_prompt_completeness.txt`` to run a single-metric generator call.
 
     The system block (``{% block system %}``) has no dynamic slots.
 
@@ -252,6 +255,10 @@ def build_generator_prompts(
         route_rubrics_constraints: Override for route constraints (loaded from
             ``ROUTE_CONSTRAINTS[route]`` if None). Reserved for future use when
             the rubrics prompt template includes a ``{route_rubrics_constraints}`` slot.
+        prompt_file: Name of the generator prompt file in ``src/prompts/``.
+            Defaults to ``'rubrics_prompt2.txt'`` (combined, both metrics).
+            Use ``'rubrics_prompt_output_relevancy.txt'`` or
+            ``'rubrics_prompt_completeness.txt'`` for single-metric split mode.
 
     Returns:
         Tuple of (system_prompt, user_prompt) ready to send to the LLM.
@@ -266,7 +273,7 @@ def build_generator_prompts(
     if route_rubrics_constraints is None:
         route_rubrics_constraints = load_route_constraints(route)
 
-    system_template, user_template = load_combined_prompt("rubrics_prompt2.txt")
+    system_template, user_template = load_combined_prompt(prompt_file)
 
     # System block has no dynamic slots
     system_prompt = system_template

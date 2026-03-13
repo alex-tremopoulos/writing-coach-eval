@@ -22,6 +22,7 @@ Manual overrides for route_intended
   new21, research_only, revise_simple_only: no overrides
 """
 
+import argparse
 import ast
 import json
 from pathlib import Path
@@ -35,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 INPUT_BASE = ROOT / "data_outputs" / "whole_input"
 OUTPUT_DIR = ROOT / "final_data"
 REF_CSV = ROOT / "data" / "data_routes_expanded.csv"
+KIWI_REF_CSV = ROOT / "data" / "data_routes_kiwi_selected167.csv"
 
 SOURCE_FOLDERS = [
     "extra10",
@@ -43,6 +45,7 @@ SOURCE_FOLDERS = [
     "respond_only",
     "revise_research_only",
     "revise_simple_only",
+    "extra167kiwi",
 ]
 
 ROUTES = ["RESPOND", "RESEARCH", "REVISE_RESEARCH", "REVISE_SIMPLE"]
@@ -178,6 +181,8 @@ def lookup_dataset_source(row: pd.Series, ref_df: pd.DataFrame) -> str | None:
         return "extra_10_manu"
     if folder == "new21":
         return "extra_21_alex"
+    if folder == "extra167kiwi":
+        return "Kiwi"
     if folder == "respond_only" and prev_id in EXTRA_RESPOND_PREV_IDS:
         return "extra_respond_alex"
 
@@ -211,33 +216,80 @@ def lookup_dataset_source(row: pd.Series, ref_df: pd.DataFrame) -> str | None:
     return None
 
 
-def write_csv(df: pd.DataFrame, path: Path) -> None:
+def write_csv(df: pd.DataFrame, path: Path, append: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-    print(f"  → wrote {len(df)} rows  to  {path.relative_to(ROOT)}")
+    mode = "a" if append and path.exists() else "w"
+    header = not (append and path.exists())
+    df.to_csv(path, index=False, mode=mode, header=header)
+    action = "appended" if mode == "a" else "wrote"
+    print(f"  → {action} {len(df)} rows  to  {path.relative_to(ROOT)}")
 
 
-def write_jsonl(records: list[dict], path: Path) -> None:
+def write_jsonl(records: list[dict], path: Path, append: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    mode = "a" if append and path.exists() else "w"
+    with open(path, mode, encoding="utf-8") as fh:
         for record in records:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(f"  → wrote {len(records)} records to  {path.relative_to(ROOT)}")
+    action = "appended" if mode == "a" else "wrote"
+    print(f"  → {action} {len(records)} records to  {path.relative_to(ROOT)}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Reassign and combine writing-coach output data."
+    )
+    parser.add_argument(
+        "--folders",
+        nargs="+",
+        default=None,
+        metavar="FOLDER",
+        help=(
+            "One or more source folder names under data_outputs/whole_input to process. "
+            "Defaults to all known folders. Example: --folders extra200kiwi"
+        ),
+    )
+    parser.add_argument(
+        "--ref-csv",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the reference CSV used for dataset_source lookup. "
+            "Relative paths are resolved from the repo root. "
+            f"Default: {REF_CSV.relative_to(ROOT)}"
+        ),
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to existing output CSV/JSONL files instead of overwriting them.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+
+    folders_to_process = args.folders if args.folders is not None else SOURCE_FOLDERS
+    ref_csv_path = Path(args.ref_csv) if args.ref_csv else REF_CSV
+    if not ref_csv_path.is_absolute():
+        ref_csv_path = ROOT / ref_csv_path
+
     # ---- 1. Read all source folders ----------------------------------------
     print("=" * 60)
     print("Reading source folders …")
+    print(f"  folders  : {folders_to_process}")
+    print(f"  ref-csv  : {ref_csv_path.relative_to(ROOT)}")
+    print(f"  append   : {args.append}")
     print("=" * 60)
 
     all_frames: list[pd.DataFrame] = []
 
-    for folder_name in SOURCE_FOLDERS:
+    for folder_name in folders_to_process:
         folder = INPUT_BASE / folder_name
         if not folder.exists():
             print(f"[WARN] folder not found, skipping: {folder}")
@@ -280,7 +332,7 @@ def main() -> None:
 
     # ---- 4b. Build dataset_source -------------------------------------------
     print("\nLooking up dataset_source …")
-    ref_df = pd.read_csv(REF_CSV)
+    ref_df = pd.read_csv(ref_csv_path)
     combined["dataset_source"] = combined.apply(
         lookup_dataset_source, axis=1, ref_df=ref_df
     )
@@ -293,6 +345,32 @@ def main() -> None:
             print(f"    prev_id={r['row_id_previous_folder']}, "
                   f"folder={r['folder_source']}, "
                   f"query={str(r['query'])[:60]}")
+
+    # ---- 4c. For extra167kiwi: set route_intended from kiwi reference CSV ----
+    # Rules:
+    #   - Queries marked RESPOND in the ref CSV → route_intended = RESPOND
+    #   - row_id 76 (REVISE_SIMPLE in orchestrator) → route_intended = REVISE_RESEARCH
+    #   - All other rows → route_intended = route_orch (already set above)
+    kiwi_mask = combined["folder_source"] == "extra167kiwi"
+    if kiwi_mask.any():
+        kiwi_ref_df = pd.read_csv(KIWI_REF_CSV)
+
+        # Collect queries that should be RESPOND according to the ref CSV
+        respond_queries = set(
+            kiwi_ref_df.loc[kiwi_ref_df["route"] == "RESPOND", "query"].str.strip()
+        )
+        respond_mask = kiwi_mask & combined["query"].str.strip().isin(respond_queries)
+        combined.loc[respond_mask, "route_intended"] = "RESPOND"
+
+        # Manual override: row_id 76 → REVISE_RESEARCH
+        row76_mask = kiwi_mask & (combined["row_id_previous_folder"] == 76)
+        combined.loc[row76_mask, "route_intended"] = "REVISE_RESEARCH"
+
+        print(f"\n  extra167kiwi route_intended:")
+        print(f"    RESPOND overrides from ref CSV : {respond_mask.sum()}")
+        print(f"    REVISE_RESEARCH override (row 76): {int(row76_mask.sum())}")
+        print(f"    Remaining use route_orch       : "
+              f"{kiwi_mask.sum() - respond_mask.sum() - int(row76_mask.sum())}")
 
     # ---- 5. Build 'output' column ------------------------------------------
     combined["output"] = combined.apply(
@@ -321,8 +399,15 @@ def main() -> None:
     extra_cols = [c for c in final.columns if c not in keep_cols and c not in output_fields_present]
     final = final[keep_cols + output_fields_present + extra_cols]
 
-    # New 1-based row_id
-    final.insert(0, "row_id", range(1, len(final) + 1))
+    # New 1-based row_id (continue from existing max when appending)
+    start_id = 1
+    if args.append and (OUTPUT_DIR / "all_results.csv").exists():
+        try:
+            existing_ids = pd.read_csv(OUTPUT_DIR / "all_results.csv", usecols=["row_id"])
+            start_id = int(existing_ids["row_id"].max()) + 1
+        except Exception:
+            pass
+    final.insert(0, "row_id", range(start_id, start_id + len(final)))
     final.reset_index(drop=True, inplace=True)
 
     # ---- 7. Write CSV -------------------------------------------------------
@@ -331,7 +416,7 @@ def main() -> None:
     print("=" * 60)
 
     csv_path = OUTPUT_DIR / "all_results.csv"
-    write_csv(final, csv_path)
+    write_csv(final, csv_path, append=args.append)
 
     # ---- 8. Write JSONL (output field as nested dict, not string) ----------
     jsonl_path = OUTPUT_DIR / "all_results.jsonl"
@@ -340,7 +425,18 @@ def main() -> None:
         rec = row.to_dict()
         rec["output"] = json.loads(rec["output"])   # un-stringify for JSONL
         records.append(rec)
-    write_jsonl(records, jsonl_path)
+    write_jsonl(records, jsonl_path, append=args.append)
+
+    # ---- 8b. Write kiwi-specific output files (extra167kiwi rows only) -----
+    kiwi_final = final[final["folder_source"] == "extra167kiwi"]
+    if not kiwi_final.empty:
+        write_csv(kiwi_final, OUTPUT_DIR / "kiwi_extra_results.csv", append=False)
+        kiwi_records = []
+        for _, row in kiwi_final.iterrows():
+            rec = row.to_dict()
+            rec["output"] = json.loads(rec["output"])
+            kiwi_records.append(rec)
+        write_jsonl(kiwi_records, OUTPUT_DIR / "kiwi_extra_results.jsonl", append=False)
 
     # ---- 9. Summary ---------------------------------------------------------
     print("\n" + "=" * 60)

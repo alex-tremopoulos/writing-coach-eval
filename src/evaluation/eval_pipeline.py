@@ -19,18 +19,26 @@ import json
 import logging
 import os
 import re
-import sys
+import argparse
 import time
+import statistics
+import mlflow
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
+from collections import Counter  # noqa: E402
 
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from src.evaluation.prompt_loader import build_generator_prompts, build_judge_prompts
+from src.evaluation.prompt_loader import (
+    build_generator_prompts,
+    build_judge_prompts,
+    format_metrics_definition,
+)
+from src.constants.metrics_definitions import METRICS_DEFINITION
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -58,7 +66,7 @@ DEFAULT_CONCURRENCY = 5
 MAX_RETRIES = 3  # passed to LangChain AzureChatOpenAI max_retries
 DEFAULT_INPUT = "final_data/all_results.csv"
 
-# Scalar summary columns written once per evaluated row
+# All columns written to CSV for each evaluated row
 EVAL_CSV_FIELDNAMES = [
     "row_id",
     "route",
@@ -67,9 +75,12 @@ EVAL_CSV_FIELDNAMES = [
     "output_relevancy_score",
     "completeness_score",
     "overall_notes",
-    # Structured fields packed as valid JSON strings
-    "rubrics_json",    # generated rubrics array
-    "verdicts_json",   # judge evaluation array
+    "generator_raw_response",
+    "rubrics_json",
+    "rubrics_reasoning",
+    "evaluation_items_json",  # evaluation_items extracted per metric from rubrics
+    "judge_raw_response",
+    "verdicts_json",
     "meta_verdicts_json",
 ]
 
@@ -77,7 +88,6 @@ METRIC_SCORE_FIELDS = {
     "output relevancy": "output_relevancy_score",
     "completeness": "completeness_score",
 }
-
 
 # ---------------------------------------------------------------------------
 # LangChain Azure OpenAI model (cached per parameter set)
@@ -238,10 +248,12 @@ def parse_markdown_rubrics(text: str) -> dict | None:
 
                 item_text = stripped[1:].strip()
                 item_importance = ""
-                importance_match = re.search(r"\(Importance:\s*([^)]+)\)\s*$", item_text)
+                # Extract importance: handles patterns like "(Importance: High)", "(Importance: High).", etc.
+                importance_match = re.search(r"\(Importance:\s*([^)]+)\)", item_text)
                 if importance_match:
                     item_importance = importance_match.group(1).strip()
-                    item_text = re.sub(r"\s*\(Importance:\s*[^)]+\)\s*$", "", item_text).strip()
+                    # Remove the "(Importance: ...)" pattern and any trailing punctuation
+                    item_text = re.sub(r"\s*\(Importance:\s*[^)]+\)[.,;:]?\s*$", "", item_text).strip()
 
                 evaluation_items.append({
                     "item": item_text,
@@ -315,6 +327,42 @@ def _extract_metric_scores(evaluation: list[dict[str, Any]]) -> dict[str, int | 
     return scores
 
 
+def _avg_std(scores: list) -> tuple[float, float]:
+    """Return (mean, stdev) of scores, or (nan, 0.0) for an empty list."""
+    if not scores:
+        return float("nan"), 0.0
+    avg = sum(scores) / len(scores)
+    return avg, (statistics.stdev(scores) if len(scores) >= 2 else 0.0)
+
+
+def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute per-route, micro, and macro score statistics from OK-status results."""
+    route_buckets: dict[str, dict[str, list]] = {}
+    for r in ok_results:
+        b = route_buckets.setdefault(r["route"], {"output_relevancy_score": [], "completeness_score": []})
+        for field in ("output_relevancy_score", "completeness_score"):
+            if r.get(field) is not None:
+                b[field].append(r[field])
+
+    per_route = {
+        route: {
+            "n": len(b["output_relevancy_score"]),
+            "output_relevancy": _avg_std(b["output_relevancy_score"]),
+            "completeness": _avg_std(b["completeness_score"]),
+        }
+        for route, b in route_buckets.items()
+    }
+    all_rel = [s for b in route_buckets.values() for s in b["output_relevancy_score"]]
+    all_comp = [s for b in route_buckets.values() for s in b["completeness_score"]]
+    route_rel_avgs = [_avg_std(b["output_relevancy_score"])[0] for b in route_buckets.values() if b["output_relevancy_score"]]
+    route_comp_avgs = [_avg_std(b["completeness_score"])[0] for b in route_buckets.values() if b["completeness_score"]]
+    return {
+        "per_route": per_route,
+        "micro": {"n": len(all_rel), "output_relevancy": _avg_std(all_rel), "completeness": _avg_std(all_comp)},
+        "macro": {"n_routes": len(route_rel_avgs), "output_relevancy": _avg_std(route_rel_avgs), "completeness": _avg_std(route_comp_avgs)},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Resume support
 # ---------------------------------------------------------------------------
@@ -344,6 +392,7 @@ def load_input_data(
     input_path: str,
     routes: list[str] | None = None,
     limit: int | None = None,
+    route_column: str = "intended",
 ) -> list[dict[str, Any]]:
     """Load and filter the input dataset.
 
@@ -358,6 +407,9 @@ def load_input_data(
         input_path: Path to all_results.csv (must have an ``output`` JSON column).
         routes: Optional list of routes to filter by (e.g., ['RESEARCH', 'RESPOND']).
         limit: Optional max number of rows to process.
+        route_column: Which route column to use: ``'intended'`` (default) for ``route_intended``,
+            or ``'orchestrator'`` for ``route_orch``. If the selected column is missing,
+            falls back to the other column.
 
     Returns:
         List of row dicts with keys: row_id, query, input, route, response_text,
@@ -365,8 +417,23 @@ def load_input_data(
     """
     df = pd.read_csv(input_path, encoding="utf-8-sig")
 
-    # Use route_intended as the gold route (fallback to route_orch if missing)
-    route_col = "route_intended" if "route_intended" in df.columns else "route_orch"
+    # Determine which route column to use
+    if route_column == "intended":
+        preferred_col = "route_intended"
+        fallback_col = "route_orch"
+    else:  # orchestrator
+        preferred_col = "route_orch"
+        fallback_col = "route_intended"
+
+    # Use preferred column if present, otherwise fall back
+    if preferred_col in df.columns:
+        route_col = preferred_col
+    elif fallback_col in df.columns:
+        logger.info("Preferred column '%s' not found, falling back to '%s'", preferred_col, fallback_col)
+        route_col = fallback_col
+    else:
+        logger.error("Neither '%s' nor '%s' column found in input CSV", preferred_col, fallback_col)
+        return []
 
     if routes:
         routes_upper = [r.upper() for r in routes]
@@ -478,6 +545,7 @@ async def process_row(
     max_tokens: int,
     semaphore: asyncio.Semaphore,
     generator_only: bool = False,
+    rubrics_mode: str = "combined",
 ) -> dict[str, Any]:
     """Run Stage 1 (generate rubrics) and optionally Stage 2 (judge rubrics) for one row.
 
@@ -488,6 +556,10 @@ async def process_row(
         max_tokens: Max tokens per LLM call.
         semaphore: Concurrency limiter.
         generator_only: If True, stop after Stage 1 and skip the judge.
+        rubrics_mode: ``'combined'`` uses a single LLM call with rubrics_prompt2.txt
+            (both metrics together). ``'split'`` makes two separate LLM calls — one
+            per metric — using the metric-specific prompt files, then merges the
+            resulting rubrics before judging.
 
     Returns:
         Dict with full evaluation results for this row.
@@ -517,30 +589,88 @@ async def process_row(
             logger.info("Row %d: processing (route=%s)", row_id, row["route"])
 
             # ---- Stage 1: Generate Rubrics ----
-            gen_system, gen_user = build_generator_prompts(
-                user_query=row["query"],
-                input_text=row["input"],
-                route=row["route"],
-            )
+            if rubrics_mode == "split":
+                # Two separate LLM calls, one per metric, then merge rubrics.
+                or_metrics_def = format_metrics_definition(
+                    {k: v for k, v in METRICS_DEFINITION.items() if k == "Output Relevancy"}
+                )
+                c_metrics_def = format_metrics_definition(
+                    {k: v for k, v in METRICS_DEFINITION.items() if k == "Completeness"}
+                )
 
-            gen_response = await call_llm(
-                deployment=deployment,
-                system_prompt=gen_system,
-                user_prompt=gen_user,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            result["generator_raw_response"] = gen_response
+                gen_system_or, gen_user_or = build_generator_prompts(
+                    user_query=row["query"],
+                    input_text=row["input"],
+                    route=row["route"],
+                    metrics_definition=or_metrics_def,
+                    prompt_file="rubrics_prompt_output_relevancy.txt",
+                )
+                gen_system_c, gen_user_c = build_generator_prompts(
+                    user_query=row["query"],
+                    input_text=row["input"],
+                    route=row["route"],
+                    metrics_definition=c_metrics_def,
+                    prompt_file="rubrics_prompt_completeness.txt",
+                )
 
-            gen_parsed = parse_json_response(gen_response)
-            if gen_parsed is None:
-                logger.warning("Row %d: Failed to parse generator response", row_id)
-                result["status"] = "GENERATOR_PARSE_ERROR"
-                return result
+                gen_response_or, gen_response_c = await asyncio.gather(
+                    call_llm(deployment, gen_system_or, gen_user_or, temperature, max_tokens),
+                    call_llm(deployment, gen_system_c, gen_user_c, temperature, max_tokens),
+                )
+                result["generator_raw_response"] = json.dumps(
+                    {"output_relevancy": gen_response_or, "completeness": gen_response_c},
+                    ensure_ascii=False,
+                )
 
-            rubrics = gen_parsed.get("rubrics", [])
+                gen_parsed_or = parse_json_response(gen_response_or)
+                gen_parsed_c  = parse_json_response(gen_response_c)
+
+                if gen_parsed_or is None:
+                    logger.warning("Row %d: Failed to parse generator response (Output Relevancy)", row_id)
+                    result["status"] = "GENERATOR_PARSE_ERROR"
+                    return result
+                if gen_parsed_c is None:
+                    logger.warning("Row %d: Failed to parse generator response (Completeness)", row_id)
+                    result["status"] = "GENERATOR_PARSE_ERROR"
+                    return result
+
+                rubrics = (
+                    gen_parsed_or.get("rubrics", [])
+                    + gen_parsed_c.get("rubrics", [])
+                )
+                result["rubrics_reasoning"] = json.dumps(
+                    {
+                        "output_relevancy": gen_parsed_or.get("reasoning", ""),
+                        "completeness": gen_parsed_c.get("reasoning", ""),
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                # combined mode: single LLM call with both metrics
+                gen_system, gen_user = build_generator_prompts(
+                    user_query=row["query"],
+                    input_text=row["input"],
+                    route=row["route"],
+                )
+                gen_response = await call_llm(
+                    deployment=deployment,
+                    system_prompt=gen_system,
+                    user_prompt=gen_user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                result["generator_raw_response"] = gen_response
+
+                gen_parsed = parse_json_response(gen_response)
+                if gen_parsed is None:
+                    logger.warning("Row %d: Failed to parse generator response", row_id)
+                    result["status"] = "GENERATOR_PARSE_ERROR"
+                    return result
+
+                rubrics = gen_parsed.get("rubrics", [])
+                result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
+
             result["rubrics"] = rubrics
-            result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
 
             if not rubrics:
                 logger.warning("Row %d: Generator produced zero rubrics", row_id)
@@ -654,7 +784,7 @@ class OutputWriter:
     async def write_result(self, result: dict[str, Any]) -> None:
         """Write one evaluation result to both CSV and JSONL."""
         async with self._lock:
-            # CSV — scalar columns + structured fields as JSON strings
+            # CSV — all result fields (nested dicts/lists as JSON strings)
             self._csv_writer.writerow({
                 "row_id": result["row_id"],
                 "route": result["route"],
@@ -663,8 +793,20 @@ class OutputWriter:
                 "output_relevancy_score": result["output_relevancy_score"],
                 "completeness_score": result["completeness_score"],
                 "overall_notes": result["overall_notes"],
+                "generator_raw_response": result["generator_raw_response"],
                 "rubrics_json": json.dumps(result["rubrics"], ensure_ascii=False)
                     if result["rubrics"] is not None else "",
+                "rubrics_reasoning": result["rubrics_reasoning"] if isinstance(result["rubrics_reasoning"], str)
+                    else json.dumps(result["rubrics_reasoning"], ensure_ascii=False)
+                    if result["rubrics_reasoning"] is not None else "",
+                "evaluation_items_json": json.dumps(
+                    [
+                        {"metric": r.get("metric"), "evaluation_items": r.get("evaluation_items", [])}
+                        for r in (result["rubrics"] or [])
+                    ],
+                    ensure_ascii=False,
+                ) if result["rubrics"] is not None else "",
+                "judge_raw_response": result["judge_raw_response"],
                 "verdicts_json": json.dumps(result["verdicts"], ensure_ascii=False)
                     if result["verdicts"] is not None else "",
                 "meta_verdicts_json": json.dumps(result["meta_verdicts"], ensure_ascii=False)
@@ -707,6 +849,9 @@ async def run_pipeline(
     resume: bool = True,
     run_name: str | None = None,
     generator_only: bool = False,
+    rubrics_mode: str = "combined",
+    route_column: str = "intended",
+    save_local: bool = False,
 ) -> None:
     """Run the full dynamic rubrics evaluation pipeline.
 
@@ -723,6 +868,12 @@ async def run_pipeline(
         run_name: Optional name for output files. Defaults to timestamp-based name.
         generator_only: If True, run only Stage 1 (rubrics generation) and skip
             the judge. Useful for testing or inspecting generated rubrics.
+        rubrics_mode: ``'combined'`` (default) uses a single generator LLM call
+            with both metrics in one prompt.  ``'split'`` makes two parallel calls,
+            one per metric, using the metric-specific prompt files, then merges the
+            rubrics before judging.
+        route_column: Which route column to use: ``'intended'`` (default) for
+            ``route_intended``, or ``'orchestrator'`` for ``route_orch``.
     """
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -739,10 +890,12 @@ async def run_pipeline(
     logger.info("Run name:    %s", run_name)
     if generator_only:
         logger.info("Mode:        GENERATOR ONLY (Stage 1, no judge)")
+    logger.info("Rubrics mode: %s", rubrics_mode)
+    logger.info("Route column: %s", route_column)
     logger.info("=" * 80)
 
     # Load data
-    rows = load_input_data(input_path, routes=routes, limit=limit)
+    rows = load_input_data(input_path, routes=routes, limit=limit, route_column=route_column)
     if not rows:
         logger.warning("No rows to process. Exiting.")
         return
@@ -775,6 +928,7 @@ async def run_pipeline(
         result = await process_row(
             row, deployment, temperature, max_tokens, semaphore,
             generator_only=generator_only,
+            rubrics_mode=rubrics_mode,
         )
         await writer.write_result(result)
         return result
@@ -806,7 +960,29 @@ async def run_pipeline(
     )
 
     # Print summary
-    _print_summary(actual_results, elapsed, writer, enriched_paths)
+    _print_summary(actual_results, elapsed, writer, enriched_paths, save_local=save_local)
+
+    # Log to MLflow
+    _log_to_mlflow(
+        results=actual_results,
+        elapsed=elapsed,
+        enriched_paths=enriched_paths,
+        results_csv=writer.results_path,
+        details_jsonl=writer.details_path,
+        save_local=save_local,
+        params={
+            "deployment": deployment,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "concurrency": concurrency,
+            "rubrics_mode": rubrics_mode,
+            "route_column": route_column,
+            "input_path": input_path,
+            "routes": routes,
+            "limit": limit,
+            "run_name": run_name,
+        },
+    )
 
 
 def build_enriched_output(
@@ -856,13 +1032,20 @@ def build_enriched_output(
     df.reset_index(drop=True, inplace=True)
 
     # Append eval columns
-    eval_scalar_cols = [
-        "eval_status", "eval_timestamp",
-        "eval_output_relevancy_score", "eval_completeness_score", "eval_overall_notes",
-        "eval_rubrics_json", "eval_verdicts_json", "eval_meta_verdicts_json",
-        "eval_generator_raw", "eval_judge_raw",
-    ]
-    for col in eval_scalar_cols:
+    _scalar_map = {
+        "eval_status": "status", "eval_timestamp": "timestamp",
+        "eval_output_relevancy_score": "output_relevancy_score",
+        "eval_completeness_score": "completeness_score",
+        "eval_overall_notes": "overall_notes",
+        "eval_generator_raw": "generator_raw_response",
+        "eval_judge_raw": "judge_raw_response",
+    }
+    _json_map = {
+        "eval_rubrics_json": "rubrics",
+        "eval_verdicts_json": "verdicts",
+        "eval_meta_verdicts_json": "meta_verdicts",
+    }
+    for col in [*_scalar_map, *_json_map]:
         df[col] = None
 
     def _to_json_str(val: Any) -> str | None:
@@ -874,16 +1057,10 @@ def build_enriched_output(
 
     for idx, row in df.iterrows():
         ev = eval_by_id[int(row["row_id"])]
-        df.at[idx, "eval_status"] = ev.get("status")
-        df.at[idx, "eval_timestamp"] = ev.get("timestamp")
-        df.at[idx, "eval_output_relevancy_score"] = ev.get("output_relevancy_score")
-        df.at[idx, "eval_completeness_score"] = ev.get("completeness_score")
-        df.at[idx, "eval_overall_notes"] = ev.get("overall_notes")
-        df.at[idx, "eval_rubrics_json"] = _to_json_str(ev.get("rubrics"))
-        df.at[idx, "eval_verdicts_json"] = _to_json_str(ev.get("verdicts"))
-        df.at[idx, "eval_meta_verdicts_json"] = _to_json_str(ev.get("meta_verdicts"))
-        df.at[idx, "eval_generator_raw"] = ev.get("generator_raw_response")
-        df.at[idx, "eval_judge_raw"] = ev.get("judge_raw_response")
+        for col, key in _scalar_map.items():
+            df.at[idx, col] = ev.get(key)
+        for col, key in _json_map.items():
+            df.at[idx, col] = _to_json_str(ev.get(key))
 
     logger.info("Enriched output: %d rows merged", len(df))
 
@@ -914,6 +1091,7 @@ def _print_summary(
     elapsed: float,
     writer: OutputWriter,
     enriched_paths: tuple[Path, Path] | None = None,
+    save_local: bool = False,
 ) -> None:
     """Print evaluation summary to console."""
     print("\n" + "=" * 80)
@@ -924,7 +1102,6 @@ def _print_summary(
     print()
 
     # Status breakdown
-    from collections import Counter  # noqa: E402
 
     status_counts = Counter(r["status"] for r in results)
     print("Status breakdown:")
@@ -932,39 +1109,154 @@ def _print_summary(
         print(f"  {status:30} {count:4}")
 
     # Score summary by route
+  
+
     ok_results = [r for r in results if r["status"] == "OK"]
     if ok_results:
+        stats = _compute_score_stats(ok_results)
         print()
         print("Scores by route:")
-        route_scores: dict[str, dict[str, list[int]]] = {}
-        for r in ok_results:
-            route_bucket = route_scores.setdefault(
-                r["route"],
-                {"output_relevancy_score": [], "completeness_score": []},
-            )
-            if r.get("output_relevancy_score") is not None:
-                route_bucket["output_relevancy_score"].append(r["output_relevancy_score"])
-            if r.get("completeness_score") is not None:
-                route_bucket["completeness_score"].append(r["completeness_score"])
-
-        for route in sorted(route_scores):
-            relevancy_scores = route_scores[route]["output_relevancy_score"]
-            completeness_scores = route_scores[route]["completeness_score"]
-            relevancy_avg = sum(relevancy_scores) / len(relevancy_scores) if relevancy_scores else float("nan")
-            completeness_avg = sum(completeness_scores) / len(completeness_scores) if completeness_scores else float("nan")
+        for route in sorted(stats["per_route"]):
+            s = stats["per_route"][route]
+            rel_avg, rel_std = s["output_relevancy"]
+            comp_avg, comp_std = s["completeness"]
             print(
-                f"  {route:20} Output Relevancy={relevancy_avg:.3f}  "
-                f"Completeness={completeness_avg:.3f}  n={len(relevancy_scores)}"
+                f"  {route:20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
+                f"Completeness={comp_avg:.3f} (±{comp_std:.3f})  n={s['n']}"
             )
+
+        print()
+        micro, macro = stats["micro"], stats["macro"]
+        rel_avg, rel_std = micro["output_relevancy"]
+        comp_avg, comp_std = micro["completeness"]
+        print(
+            f"  {'OVERALL (micro)':20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
+            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})  n={micro['n']}"
+        )
+        rel_avg, rel_std = macro["output_relevancy"]
+        comp_avg, comp_std = macro["completeness"]
+        print(
+            f"  {'OVERALL (macro)':20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
+            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})  n_routes={macro['n_routes']}"
+        )
 
     print()
-    print(f"Outputs saved:")
-    print(f"  Summary  : {writer.results_path}")
-    print(f"  Details  : {writer.details_path}")
-    if enriched_paths:
-        print(f"  Enriched CSV  : {enriched_paths[0]}")
-        print(f"  Enriched JSONL: {enriched_paths[1]}")
+    if save_local:
+        print("Outputs saved locally:")
+        print(f"  Summary  : {writer.results_path}")
+        print(f"  Details  : {writer.details_path}")
+        if enriched_paths:
+            print(f"  Enriched CSV  : {enriched_paths[0]}")
+            print(f"  Enriched JSONL: {enriched_paths[1]}")
+    else:
+        print("Outputs uploaded to MLflow (local files will be removed).")
     print("=" * 80)
+
+
+def _log_to_mlflow(
+    results: list[dict[str, Any]],
+    elapsed: float,
+    params: dict[str, Any],
+    enriched_paths: tuple[Path, Path] | None = None,
+    results_csv: Path | None = None,
+    details_jsonl: Path | None = None,
+    save_local: bool = False,
+) -> None:
+    """Log evaluation run parameters and metrics to MLflow.
+
+    Tracking URI is read from the ``MLFLOW_TRACKING_URI`` environment variable
+    (defaults to a local ``mlruns/`` folder if not set). Experiment name is
+    derived from ``rubrics_mode`` so that combined-prompt and split-prompt runs
+    are stored in separate MLflow experiment folders.
+    """
+    rubrics_mode = params.get("rubrics_mode", "combined")
+    route_source = params.get("route_column", "intended")  # "intended" or "orchestrator"
+    n_total = len(results)
+    ts = datetime.now().strftime("%m%d_%H%M")
+    mlflow_run_name = f"{ts}_{route_source}_{n_total}rows"
+
+    experiment_name = f"wc-eval-rubrics-{rubrics_mode}"
+    mlflow.set_experiment(experiment_name)
+
+    with mlflow.start_run(run_name=mlflow_run_name):
+        # ---- Parameters ----
+        mlflow.log_param("deployment", params.get("deployment"))
+        mlflow.log_param("temperature", params.get("temperature"))
+        mlflow.log_param("max_tokens", params.get("max_tokens"))
+        mlflow.log_param("concurrency", params.get("concurrency"))
+        mlflow.log_param("rubrics_mode", rubrics_mode)
+        mlflow.log_param("route_source", route_source)
+        mlflow.log_param("input_path", params.get("input_path"))
+        mlflow.log_param(
+            "routes_filter",
+            json.dumps(params["routes"]) if params.get("routes") else "all",
+        )
+        mlflow.log_param("limit", params.get("limit"))
+
+        # ---- Input dataset ----
+        try:
+            input_path = params.get("input_path", "")
+            if input_path:
+                evaluated_ids = {r["row_id"] for r in results}
+                input_df = pd.read_csv(input_path, encoding="utf-8-sig")
+                input_df_eval = input_df[input_df["row_id"].isin(evaluated_ids)]
+                dataset = mlflow.data.from_pandas(
+                    input_df_eval,
+                    source=input_path,
+                    name="eval_input",
+                )
+                mlflow.log_input(dataset, context="evaluation")
+        except Exception as exc:
+            logger.warning("Failed to log dataset to MLflow: %s", exc)
+
+        # ---- Run-level counters ----
+        status_counts = Counter(r["status"] for r in results)
+        mlflow.log_metric("total_rows", len(results))
+        mlflow.log_metric("ok_rows", status_counts.get("OK", 0))
+        mlflow.log_metric("elapsed_seconds", round(elapsed, 1))
+        for status, count in status_counts.items():
+            mlflow.log_metric(f"status_{status.lower()}_count", count)
+
+        # ---- Per-route and aggregate scores ----
+        ok_results = [r for r in results if r["status"] == "OK"]
+        if ok_results:
+            stats = _compute_score_stats(ok_results)
+            for route in sorted(stats["per_route"]):
+                s = stats["per_route"][route]
+                prefix = route.lower()
+                mlflow.log_metric(f"{prefix}_n", s["n"])
+                if s["n"] > 0:
+                    for metric in ("output_relevancy", "completeness"):
+                        avg, std = s[metric]
+                        mlflow.log_metric(f"{prefix}_{metric}_avg", avg)
+                        mlflow.log_metric(f"{prefix}_{metric}_std", std)
+
+            for level, n_key in (("micro", "n"), ("macro", "n_routes")):
+                ls = stats[level]
+                if ls[n_key] > 0:
+                    for metric in ("output_relevancy", "completeness"):
+                        avg, std = ls[metric]
+                        mlflow.log_metric(f"{level}_{metric}_avg", avg)
+                        mlflow.log_metric(f"{level}_{metric}_std", std)
+
+        # ---- Artifacts: actual result data ----
+        artifact_paths = [results_csv, details_jsonl, *(enriched_paths or [])]
+        for path in artifact_paths:
+            if path and Path(path).exists():
+                mlflow.log_artifact(str(path), artifact_path="results")
+
+        # ---- Cleanup local files (only after successful upload) ----
+        # Note: keep `details_jsonl` locally to support pipeline resume and debugging.
+        cleanup_paths = [results_csv, *(enriched_paths or [])]
+        if not save_local:
+            for path in cleanup_paths:
+                if path and Path(path).exists():
+                    try:
+                        Path(path).unlink()
+                    except Exception as exc:
+                        logger.warning("Failed to delete local file %s: %s", path, exc)
+
+    logger.info("MLflow run logged to experiment '%s'", experiment_name)
 
 
 # ---------------------------------------------------------------------------
@@ -973,8 +1265,6 @@ def _print_summary(
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="Dynamic Rubrics Evaluation Pipeline for Writing Coach V2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1047,9 +1337,39 @@ def main():
         help="Run Stage 1 only (rubrics generation) — skip the judge. Useful for testing.",
     )
     parser.add_argument(
+        "--rubrics-mode",
+        choices=["combined", "split"],
+        default="combined",
+        help=(
+            "How to run the rubrics generator. "
+            "'combined' (default): single LLM call with both metrics in one prompt (rubrics_prompt2.txt). "
+            "'split': two parallel LLM calls, one per metric, using the metric-specific prompt files."
+        ),
+    )
+    parser.add_argument(
+        "--route-column",
+        choices=["intended", "orchestrator"],
+        default="intended",
+        help=(
+            "Which route column to use from the input CSV. "
+            "'intended' (default): use route_intended (the ground truth route). "
+            "'orchestrator': use route_orch (the orchestrator's predicted route). "
+            "Falls back to the other column if the preferred one is missing."
+        ),
+    )
+    parser.add_argument(
         "--run-name",
         default=None,
         help="Name for output files (default: eval_YYYYMMDD_HHMMSS)",
+    )
+    parser.add_argument(
+        "--save-local",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep output files on disk after the run (default: False). "
+            "By default, files are uploaded to MLflow and then deleted locally."
+        ),
     )
 
     args = parser.parse_args()
@@ -1067,6 +1387,9 @@ def main():
             resume=not args.no_resume,
             run_name=args.run_name,
             generator_only=args.generator_only,
+            rubrics_mode=args.rubrics_mode,
+            route_column=args.route_column,
+            save_local=args.save_local,
         )
     )
 
