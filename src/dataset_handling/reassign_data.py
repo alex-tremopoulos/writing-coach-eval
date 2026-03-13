@@ -44,6 +44,7 @@ SOURCE_FOLDERS = [
     "respond_only",
     "revise_research_only",
     "revise_simple_only",
+    "extra167kiwi",
 ]
 
 ROUTES = ["RESPOND", "RESEARCH", "REVISE_RESEARCH", "REVISE_SIMPLE"]
@@ -179,7 +180,7 @@ def lookup_dataset_source(row: pd.Series, ref_df: pd.DataFrame) -> str | None:
         return "extra_10_manu"
     if folder == "new21":
         return "extra_21_alex"
-    if folder == "extra200kiwi":
+    if folder == "extra167kiwi":
         return "Kiwi"
     if folder == "respond_only" and prev_id in EXTRA_RESPOND_PREV_IDS:
         return "extra_respond_alex"
@@ -344,8 +345,8 @@ def main() -> None:
                   f"folder={r['folder_source']}, "
                   f"query={str(r['query'])[:60]}")
 
-    # ---- 4c. For extra200kiwi: override route_intended from ref CSV ---------
-    kiwi_mask = combined["folder_source"] == "extra200kiwi"
+    # ---- 4c. For extra167kiwi: override route_intended from ref CSV ---------
+    kiwi_mask = combined["folder_source"] == "extra167kiwi"
     if kiwi_mask.any() and "route" in ref_df.columns:
         # Strip whitespace from queries on both sides to handle minor mismatches
         kiwi_route_map = {str(q).strip(): r for q, r in zip(ref_df["query"], ref_df["route"])}
@@ -354,11 +355,11 @@ def main() -> None:
         )
         matched = kiwi_intended.notna()
         combined.loc[kiwi_mask & matched, "route_intended"] = kiwi_intended[matched]
-        print(f"\n  extra200kiwi route_intended set from ref CSV: "
+        print(f"\n  extra167kiwi route_intended set from ref CSV: "
               f"{matched.sum()} / {kiwi_mask.sum()} rows")
         if (~matched).any():
             unmatched = combined.loc[kiwi_mask & ~matched, "query"]
-            print("  [WARN] Unmatched extra200kiwi queries for route_intended:")
+            print("  [WARN] Unmatched extra167kiwi queries for route_intended:")
             for q in unmatched:
                 print(f"    {str(q)[:80]}")
 
@@ -417,16 +418,16 @@ def main() -> None:
         records.append(rec)
     write_jsonl(records, jsonl_path, append=args.append)
 
-    # ---- 8b. Write kiwi-specific output files (extra200kiwi rows only) -----
-    kiwi_final = final[final["folder_source"] == "extra200kiwi"]
+    # ---- 8b. Write kiwi-specific output files (extra167kiwi rows only) -----
+    kiwi_final = final[final["folder_source"] == "extra167kiwi"]
     if not kiwi_final.empty:
-        write_csv(kiwi_final, OUTPUT_DIR / "kiwi_extra_results.csv", append=args.append)
+        write_csv(kiwi_final, OUTPUT_DIR / "kiwi_extra_results.csv", append=False)
         kiwi_records = []
         for _, row in kiwi_final.iterrows():
             rec = row.to_dict()
             rec["output"] = json.loads(rec["output"])
             kiwi_records.append(rec)
-        write_jsonl(kiwi_records, OUTPUT_DIR / "kiwi_extra_results.jsonl", append=args.append)
+        write_jsonl(kiwi_records, OUTPUT_DIR / "kiwi_extra_results.jsonl", append=False)
 
     # ---- 9. Summary ---------------------------------------------------------
     print("\n" + "=" * 60)
