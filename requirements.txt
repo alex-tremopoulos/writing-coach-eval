@@ -1,3 +1,4 @@
+dagshub==0.6.8
 datasets==4.0.0
 fsspec==2024.10.0
 fuzzywuzzy==0.18.0
@@ -6,6 +7,7 @@ langchain==1.2.10
 langchain-openai==1.1.10
 Levenshtein==0.27.3
 langgraph==1.0.9
+mlflow==3.10.1
 openai==2.21.0
 pandas==3.0.1
 poetry==2.3.2

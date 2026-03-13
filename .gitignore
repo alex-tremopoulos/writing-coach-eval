@@ -6,3 +6,4 @@
 **/__pycache__
 /data_outputs
 /eval_data
+mlflow.db
