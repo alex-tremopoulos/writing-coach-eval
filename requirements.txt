@@ -1,4 +1,5 @@
 datasets==4.0.0
+giskard[llm]>=2.0.0
 fsspec==2024.10.0
 fuzzywuzzy==0.18.0
 huggingface_hub==1.4.1
