@@ -393,6 +393,7 @@ def load_input_data(
     routes: list[str] | None = None,
     limit: int | None = None,
     route_column: str = "intended",
+    data_origin: str = "all",
 ) -> list[dict[str, Any]]:
     """Load and filter the input dataset.
 
@@ -410,6 +411,9 @@ def load_input_data(
         route_column: Which route column to use: ``'intended'`` (default) for ``route_intended``,
             or ``'orchestrator'`` for ``route_orch``. If the selected column is missing,
             falls back to the other column.
+        data_origin: Filter rows by data origin. ``'all'`` (default) keeps all rows.
+            ``'synthetic'`` keeps rows whose ``dataset_source`` starts with ``'Synthetic'``
+            or equals ``'extra_respond_alex'``. ``'natural'`` keeps all other rows.
 
     Returns:
         List of row dicts with keys: row_id, query, input, route, response_text,
@@ -439,6 +443,20 @@ def load_input_data(
         routes_upper = [r.upper() for r in routes]
         df = df[df[route_col].str.upper().isin(routes_upper)]
         logger.info("Filtered to routes %s: %d rows", routes_upper, len(df))
+
+    if data_origin != "all":
+        if "dataset_source" not in df.columns:
+            logger.warning("'dataset_source' column not found — data_origin filter '%s' ignored", data_origin)
+        else:
+            is_synthetic = (
+                df["dataset_source"].str.startswith("Synthetic", na=False)
+                | (df["dataset_source"] == "extra_respond_alex")
+            )
+            if data_origin == "synthetic":
+                df = df[is_synthetic]
+            else:  # natural
+                df = df[~is_synthetic]
+            logger.info("Filtered to data_origin='%s': %d rows", data_origin, len(df))
 
     if limit:
         df = df.head(limit)
@@ -852,6 +870,7 @@ async def run_pipeline(
     rubrics_mode: str = "combined",
     route_column: str = "intended",
     save_local: bool = False,
+    data_origin: str = "all",
 ) -> None:
     """Run the full dynamic rubrics evaluation pipeline.
 
@@ -874,6 +893,8 @@ async def run_pipeline(
             rubrics before judging.
         route_column: Which route column to use: ``'intended'`` (default) for
             ``route_intended``, or ``'orchestrator'`` for ``route_orch``.
+        data_origin: Filter rows by data origin. ``'all'`` (default) keeps all rows.
+            ``'synthetic'`` or ``'natural'`` filters on the ``dataset_source`` column.
     """
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -892,10 +913,11 @@ async def run_pipeline(
         logger.info("Mode:        GENERATOR ONLY (Stage 1, no judge)")
     logger.info("Rubrics mode: %s", rubrics_mode)
     logger.info("Route column: %s", route_column)
+    logger.info("Data origin:  %s", data_origin)
     logger.info("=" * 80)
 
     # Load data
-    rows = load_input_data(input_path, routes=routes, limit=limit, route_column=route_column)
+    rows = load_input_data(input_path, routes=routes, limit=limit, route_column=route_column, data_origin=data_origin)
     if not rows:
         logger.warning("No rows to process. Exiting.")
         return
@@ -981,6 +1003,7 @@ async def run_pipeline(
             "routes": routes,
             "limit": limit,
             "run_name": run_name,
+            "data_origin": data_origin,
         },
     )
 
@@ -1186,6 +1209,7 @@ def _log_to_mlflow(
         mlflow.log_param("concurrency", params.get("concurrency"))
         mlflow.log_param("rubrics_mode", rubrics_mode)
         mlflow.log_param("route_source", route_source)
+        mlflow.log_param("data_origin", params.get("data_origin", "all"))
         mlflow.log_param("input_path", params.get("input_path"))
         mlflow.log_param(
             "routes_filter",
@@ -1369,6 +1393,16 @@ def main():
             "By default, files are uploaded to MLflow and then deleted locally."
         ),
     )
+    parser.add_argument(
+        "--data-origin",
+        choices=["all", "natural", "synthetic"],
+        default="all",
+        help=(
+            "Filter rows by data origin (default: all). "
+            "'synthetic': rows where dataset_source starts with 'Synthetic' or equals 'extra_respond_alex'. "
+            "'natural': all other rows."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1388,6 +1422,7 @@ def main():
             rubrics_mode=args.rubrics_mode,
             route_column=args.route_column,
             save_local=args.save_local,
+            data_origin=args.data_origin,
         )
     )
 
