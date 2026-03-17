@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Evaluation Result Viewer</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="backdrop"></div>
+  <div class="app-shell">
+    <aside class="sidebar panel">
+      <div class="sidebar-header">
+        <p class="eyebrow">Interface</p>
+        <h1>Evaluation Result Viewer</h1>
+        <p class="lede">
+          Upload a JSON or JSONL file, filter by route fields, and inspect one selected row at a time.
+        </p>
+      </div>
+
+      <label class="upload-zone" for="fileInput">
+        <span class="upload-title">Upload evaluation file</span>
+        <span class="upload-subtitle">Accepts JSONL and JSON arrays</span>
+        <input id="fileInput" type="file" accept=".json,.jsonl,application/json">
+      </label>
+
+      <div class="sidebar-tools">
+        <label class="field-label" for="orchFilter">Orch Route</label>
+        <select id="orchFilter" class="filter-input">
+          <option value="ALL">All orchestration routes</option>
+        </select>
+
+        <label class="field-label" for="intendedFilter">Intended Route</label>
+        <select id="intendedFilter" class="filter-input">
+          <option value="ALL">All intended routes</option>
+        </select>
+
+        <label class="field-label" for="rowSelect">Row ID</label>
+        <select id="rowSelect" class="filter-input">
+          <option value="">Select a row</option>
+        </select>
+      </div>
+
+      <div class="file-status" id="fileStatus">
+        No file loaded yet.
+      </div>
+
+      <div class="warning-box hidden" id="warningBox"></div>
+
+    </aside>
+
+    <main class="viewer-grid">
+      <section class="viewer-row two-column">
+        <article class="panel content-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">User Request</p>
+              <h2>Input and Query</h2>
+            </div>
+            <div class="example-meta" id="selectedMeta"></div>
+          </div>
+          <div class="split-content">
+            <section class="content-block">
+              <h3>Query</h3>
+              <div class="scroll-block text-block" id="queryBlock"></div>
+            </section>
+            <section class="content-block grow">
+              <h3>Input</h3>
+              <div class="scroll-block text-block" id="inputBlock"></div>
+            </section>
+          </div>
+        </article>
+
+        <article class="panel content-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Route Output</p>
+              <h2>Selected Route Panel</h2>
+            </div>
+          </div>
+          <div class="route-grid" id="routeGrid"></div>
+        </article>
+      </section>
+
+      <section class="viewer-row two-column">
+        <article class="panel content-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Rubrics</p>
+              <h2>Metric Definitions and Evaluation Items</h2>
+            </div>
+            <div class="source-chip" id="rubricSource"></div>
+          </div>
+          <div class="scroll-block" id="rubricsBlock"></div>
+        </article>
+
+        <article class="panel content-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Verdicts</p>
+              <h2>Scores and Reasoning</h2>
+            </div>
+          </div>
+          <div class="scroll-block" id="verdictsBlock"></div>
+        </article>
+      </section>
+
+      <section class="viewer-row one-column">
+        <article class="panel footer-panel">
+          <div class="panel-header compact">
+            <div>
+              <p class="eyebrow">Overall Summary</p>
+              <h2>Notes and Final Metric Scores</h2>
+            </div>
+            <div class="score-strip" id="scoreStrip"></div>
+          </div>
+          <div class="scroll-block text-block compact" id="overallNotesBlock"></div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
