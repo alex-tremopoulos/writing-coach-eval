@@ -19,9 +19,8 @@ const refs = {
   queryBlock: document.getElementById("queryBlock"),
   inputBlock: document.getElementById("inputBlock"),
   routeGrid: document.getElementById("routeGrid"),
-  rubricSource: document.getElementById("rubricSource"),
-  rubricsBlock: document.getElementById("rubricsBlock"),
-  verdictsBlock: document.getElementById("verdictsBlock"),
+  relevancyBlock: document.getElementById("relevancyBlock"),
+  completenessBlock: document.getElementById("completenessBlock"),
   scoreStrip: document.getElementById("scoreStrip"),
   overallNotesBlock: document.getElementById("overallNotesBlock")
 };
@@ -306,7 +305,7 @@ function renderSelectedExample() {
 
   renderUserRequest(example);
   renderRoutes(example);
-  renderRubricsAndVerdicts(example);
+  renderScoring(example);
   renderOverallSummary(example);
 }
 
@@ -316,11 +315,10 @@ function renderNoSelection() {
   setFormattedContent(refs.inputBlock, "");
   refs.routeGrid.textContent = "";
   refs.routeGrid.appendChild(buildPlaceholder("Route outputs will appear here."));
-  refs.rubricSource.textContent = "";
-  refs.rubricsBlock.textContent = "";
-  refs.rubricsBlock.appendChild(buildPlaceholder("Rubrics will appear here."));
-  refs.verdictsBlock.textContent = "";
-  refs.verdictsBlock.appendChild(buildPlaceholder("Verdicts will appear here."));
+  refs.relevancyBlock.textContent = "";
+  refs.completenessBlock.textContent = "";
+  refs.relevancyBlock.appendChild(buildPlaceholder("Output Relevancy details will appear here."));
+  refs.completenessBlock.appendChild(buildPlaceholder("Completeness details will appear here."));
   refs.scoreStrip.textContent = "";
   setFormattedContent(refs.overallNotesBlock, "No evaluation summary is available yet.");
 }
@@ -415,34 +413,37 @@ function buildSuggestionCard(suggestion, index) {
   return card;
 }
 
-function renderRubricsAndVerdicts(example) {
+function renderScoring(example) {
   const evalRow = pickEvaluationRow(example);
   const rubrics = getRubrics(evalRow);
   const verdicts = getVerdicts(evalRow);
   const rubricGroups = rubrics.length ? buildRubricGroups(rubrics) : [];
 
-  refs.rubricSource.textContent = evalRow ? `source ${getRouteName(evalRow) || "selected row"}` : "";
-  refs.rubricsBlock.textContent = "";
-  refs.verdictsBlock.textContent = "";
+  refs.relevancyBlock.textContent = "";
+  refs.completenessBlock.textContent = "";
 
-  if (!rubrics.length) {
-    refs.rubricsBlock.appendChild(buildPlaceholder("No rubric payload is available in the selected row."));
-  } else {
-    const stack = document.createElement("div");
-    stack.className = "metric-stack";
-    rubricGroups.forEach((group) => stack.appendChild(buildRubricMetricCard(group)));
-    refs.rubricsBlock.appendChild(stack);
-  }
-
-  if (!rubricGroups.length || !verdicts.length) {
-    refs.verdictsBlock.appendChild(buildPlaceholder("No verdict payload is available for the selected row."));
+  if (!rubricGroups.length) {
+    refs.relevancyBlock.appendChild(buildPlaceholder("No Output Relevancy payload is available in the selected row."));
+    refs.completenessBlock.appendChild(buildPlaceholder("No Completeness payload is available in the selected row."));
     return;
   }
 
-  const verdictStack = document.createElement("div");
-  verdictStack.className = "verdict-stack";
-  rubricGroups.forEach((group) => verdictStack.appendChild(buildVerdictMetricCard(group, verdicts)));
-  refs.verdictsBlock.appendChild(verdictStack);
+  const groupsByMetric = new Map(rubricGroups.map((group) => [normalizeComparisonText(group.name), group]));
+  renderScoringMetricColumn(refs.relevancyBlock, groupsByMetric.get(normalizeComparisonText("Output Relevancy")), verdicts, "Output Relevancy");
+  renderScoringMetricColumn(refs.completenessBlock, groupsByMetric.get(normalizeComparisonText("Completeness")), verdicts, "Completeness");
+}
+
+function renderScoringMetricColumn(container, group, verdicts, label) {
+  container.textContent = "";
+  if (!group) {
+    container.appendChild(buildPlaceholder(`No ${label} payload is available in the selected row.`));
+    return;
+  }
+
+  const stack = document.createElement("div");
+  stack.className = "metric-stack";
+  stack.appendChild(buildScoringMetricCard(group, verdicts));
+  container.appendChild(stack);
 }
 
 function buildRubricGroups(rubrics) {
@@ -505,50 +506,9 @@ function buildRubricGroups(rubrics) {
   return orderedGroups;
 }
 
-function buildRubricMetricCard(group) {
+function buildScoringMetricCard(group, verdicts) {
   const card = document.createElement("article");
-  card.className = "metric-card";
-
-  const topLine = document.createElement("div");
-  topLine.className = "metric-topline";
-  topLine.appendChild(buildPill(group.name, "example-id"));
-  if (group.maxScore !== null) {
-    topLine.appendChild(buildPill(`max ${group.maxScore}`, "pill"));
-  }
-
-  const summary = document.createElement("p");
-  summary.className = "metric-summary";
-  summary.textContent = group.description;
-
-  const itemGrid = document.createElement("div");
-  itemGrid.className = "item-grid";
-
-  group.items.forEach((item) => {
-    const itemCard = document.createElement("article");
-    itemCard.className = "item-card";
-
-    const title = document.createElement("h4");
-    title.textContent = `${item.label} ${item.criterion}`;
-
-    const weight = buildPill(`importance ${item.weight}`, "score-chip");
-
-    itemCard.append(title, weight);
-    if (item.description && item.description !== group.description) {
-      const description = document.createElement("p");
-      description.className = "small-copy";
-      description.textContent = item.description;
-      itemCard.appendChild(description);
-    }
-    itemGrid.appendChild(itemCard);
-  });
-
-  card.append(topLine, summary, itemGrid);
-  return card;
-}
-
-function buildVerdictMetricCard(group, verdicts) {
-  const card = document.createElement("article");
-  card.className = "verdict-card";
+  card.className = "score-card";
 
   const metricVerdict = matchMetricVerdict(group, verdicts);
   const verdictItems = group.items.map((item) => ({
@@ -565,42 +525,42 @@ function buildVerdictMetricCard(group, verdicts) {
     : scores.length
       ? scores.reduce((sum, score) => sum + score, 0) / scores.length
       : null;
-  const summaryText = firstText(metricVerdict?.reasoning, summarizeVerdicts(verdictItems.map((entry) => entry.verdict).filter(Boolean)));
+  const summaryText = firstText(metricVerdict?.reasoning, summarizeVerdicts(verdictItems.map((entry) => entry.verdict).filter(Boolean)), "No metric-level reasoning is available for this metric.");
   const scoreLabel = formatScoreValue(averageScore, group.maxScore);
 
-  const topLine = document.createElement("div");
-  topLine.className = "verdict-topline";
-  topLine.appendChild(buildPill(group.name, "example-id"));
-  topLine.appendChild(buildPill(scoreLabel === null ? "score n/a" : `score ${scoreLabel}`, "score-chip"));
+  const definition = document.createElement("p");
+  definition.className = "metric-definition";
+  definition.textContent = group.description;
 
-  const summary = document.createElement("p");
-  summary.className = "verdict-summary";
-  summary.textContent = summaryText || "No metric-level reasoning could be derived from the available item verdicts.";
+  const metricMeta = document.createElement("div");
+  metricMeta.className = "metric-meta";
 
-  if (metricVerdict?.item_resolution_summary) {
-    const resolution = ensureObject(metricVerdict.item_resolution_summary) || metricVerdict.item_resolution_summary;
-    const metaRow = document.createElement("div");
-    metaRow.className = "meta-row";
-    metaRow.appendChild(buildPill(`resolved ${firstText(resolution?.resolved_count, 0)}`, "score-chip"));
-    metaRow.appendChild(buildPill(`partial ${firstText(resolution?.partially_resolved_count, 0)}`, "pill"));
-    metaRow.appendChild(buildPill(`unresolved ${firstText(resolution?.unresolved_count, 0)}`, "pill"));
-    card.append(topLine, summary, metaRow);
-  } else {
-    card.append(topLine, summary);
+  const metricMetaRow = document.createElement("div");
+  metricMetaRow.className = "metric-meta-row";
+  metricMetaRow.appendChild(buildPill(scoreLabel === null ? "score n/a" : `score ${scoreLabel}`, "score-chip"));
+  if (group.maxScore !== null) {
+    metricMetaRow.appendChild(buildPill(`max ${group.maxScore}`, "pill"));
   }
 
+  const metricReasoning = document.createElement("p");
+  metricReasoning.className = "metric-reasoning";
+  metricReasoning.textContent = summaryText;
+
+  metricMeta.append(metricMetaRow, metricReasoning);
+
   const itemGrid = document.createElement("div");
-  itemGrid.className = "item-grid";
+  itemGrid.className = "item-grid compact";
 
   verdictItems.forEach(({ item, verdict }) => {
     const itemCard = document.createElement("article");
-    itemCard.className = "verdict-item";
+    itemCard.className = "item-card";
 
     const title = document.createElement("h4");
     title.textContent = `${item.label} ${item.criterion}`;
 
     const metaRow = document.createElement("div");
     metaRow.className = "meta-row";
+    metaRow.appendChild(buildPill(`importance ${item.weight}`, "pill"));
     metaRow.appendChild(buildPill(formatScoreValue(verdict?.score, group.maxScore) || "n/a", "score-chip"));
 
     const reasoning = document.createElement("p");
@@ -611,7 +571,7 @@ function buildVerdictMetricCard(group, verdicts) {
     itemGrid.appendChild(itemCard);
   });
 
-  card.append(itemGrid);
+  card.append(definition, metricMeta, itemGrid);
   return card;
 }
 

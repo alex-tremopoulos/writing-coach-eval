@@ -9,8 +9,8 @@
 <body>
   <div class="backdrop"></div>
   <div class="app-shell">
-    <aside class="sidebar panel">
-      <div class="sidebar-header">
+    <section class="topbar panel">
+      <div class="topbar-header">
         <p class="eyebrow">Interface</p>
         <h1>Evaluation Result Viewer</h1>
         <p class="lede">
@@ -18,39 +18,61 @@
         </p>
       </div>
 
-      <label class="upload-zone" for="fileInput">
-        <span class="upload-title">Upload evaluation file</span>
-        <span class="upload-subtitle">Accepts JSONL and JSON arrays</span>
-        <input id="fileInput" type="file" accept=".json,.jsonl,application/json">
-      </label>
+      <div class="topbar-tools">
+        <label class="upload-zone" for="fileInput">
+          <span class="upload-title">Upload evaluation file</span>
+          <span class="upload-subtitle">Accepts JSONL and JSON arrays</span>
+          <input id="fileInput" type="file" accept=".json,.jsonl,application/json">
+        </label>
 
-      <div class="sidebar-tools">
-        <label class="field-label" for="orchFilter">Orch Route</label>
-        <select id="orchFilter" class="filter-input">
-          <option value="ALL">All orchestration routes</option>
-        </select>
+        <div class="toolbar-field">
+          <label class="field-label" for="orchFilter">Orch Route</label>
+          <select id="orchFilter" class="filter-input">
+            <option value="ALL">All orchestration routes</option>
+          </select>
+        </div>
 
-        <label class="field-label" for="intendedFilter">Intended Route</label>
-        <select id="intendedFilter" class="filter-input">
-          <option value="ALL">All intended routes</option>
-        </select>
+        <div class="toolbar-field">
+          <label class="field-label" for="intendedFilter">Intended Route</label>
+          <select id="intendedFilter" class="filter-input">
+            <option value="ALL">All intended routes</option>
+          </select>
+        </div>
 
-        <label class="field-label" for="rowSelect">Row ID</label>
-        <select id="rowSelect" class="filter-input">
-          <option value="">Select a row</option>
-        </select>
+        <div class="toolbar-field">
+          <label class="field-label" for="rowSelect">Row ID</label>
+          <select id="rowSelect" class="filter-input">
+            <option value="">Select a row</option>
+          </select>
+        </div>
       </div>
 
-      <div class="file-status" id="fileStatus">
-        No file loaded yet.
+      <div class="topbar-status">
+        <div class="file-status" id="fileStatus">
+          No file loaded yet.
+        </div>
+
+        <div class="warning-box hidden" id="warningBox"></div>
       </div>
-
-      <div class="warning-box hidden" id="warningBox"></div>
-
-    </aside>
+    </section>
 
     <main class="viewer-grid">
-      <section class="viewer-row two-column">
+      <section class="viewer-row one-column">
+        <article class="panel footer-panel summary-panel">
+          <div class="panel-header compact">
+            <div>
+              <p class="eyebrow">Overall Summary</p>
+              <h2>Notes and Final Metric Scores</h2>
+            </div>
+            <div class="score-strip" id="scoreStrip"></div>
+          </div>
+          <div class="summary-content">
+            <div class="scroll-block text-block compact" id="overallNotesBlock"></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="viewer-row four-column">
         <article class="panel content-panel">
           <div class="panel-header">
             <div>
@@ -80,41 +102,25 @@
           </div>
           <div class="route-grid" id="routeGrid"></div>
         </article>
-      </section>
 
-      <section class="viewer-row two-column">
         <article class="panel content-panel">
           <div class="panel-header">
             <div>
-              <p class="eyebrow">Rubrics</p>
-              <h2>Metric Definitions and Evaluation Items</h2>
+              <p class="eyebrow">Scoring</p>
+              <h2>Output Relevancy</h2>
             </div>
-            <div class="source-chip" id="rubricSource"></div>
           </div>
-          <div class="scroll-block" id="rubricsBlock"></div>
+          <div class="scroll-block" id="relevancyBlock"></div>
         </article>
 
         <article class="panel content-panel">
           <div class="panel-header">
             <div>
-              <p class="eyebrow">Verdicts</p>
-              <h2>Scores and Reasoning</h2>
+              <p class="eyebrow">Scoring</p>
+              <h2>Completeness</h2>
             </div>
           </div>
-          <div class="scroll-block" id="verdictsBlock"></div>
-        </article>
-      </section>
-
-      <section class="viewer-row one-column">
-        <article class="panel footer-panel">
-          <div class="panel-header compact">
-            <div>
-              <p class="eyebrow">Overall Summary</p>
-              <h2>Notes and Final Metric Scores</h2>
-            </div>
-            <div class="score-strip" id="scoreStrip"></div>
-          </div>
-          <div class="scroll-block text-block compact" id="overallNotesBlock"></div>
+          <div class="scroll-block" id="completenessBlock"></div>
         </article>
       </section>
     </main>
