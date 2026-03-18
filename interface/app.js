@@ -12,6 +12,8 @@ const refs = {
   fileInput: document.getElementById("fileInput"),
   orchFilter: document.getElementById("orchFilter"),
   intendedFilter: document.getElementById("intendedFilter"),
+  relevancyScoreFilter: document.getElementById("relevancyScoreFilter"),
+  completenessScoreFilter: document.getElementById("completenessScoreFilter"),
   rowSelect: document.getElementById("rowSelect"),
   fileStatus: document.getElementById("fileStatus"),
   warningBox: document.getElementById("warningBox"),
@@ -47,6 +49,20 @@ refs.orchFilter.addEventListener("change", () => {
 });
 
 refs.intendedFilter.addEventListener("change", () => {
+  filterExamples();
+  renderStatus();
+  renderFilterControls();
+  renderSelectedExample();
+});
+
+refs.relevancyScoreFilter.addEventListener("change", () => {
+  filterExamples();
+  renderStatus();
+  renderFilterControls();
+  renderSelectedExample();
+});
+
+refs.completenessScoreFilter.addEventListener("change", () => {
   filterExamples();
   renderStatus();
   renderFilterControls();
@@ -191,6 +207,8 @@ function finalizeExample(row, index) {
     displayId: firstText(row.row_id, row.row_id_previous_folder, row.example_id, String(index + 1)),
     routeOrchValue: normalizeRouteValue(firstText(row.route_orch, getRouteName(row))),
     routeIntendedValue: normalizeRouteValue(firstText(row.route_intended, getRouteName(row))),
+    outputRelevancyScore: firstText(row.eval_output_relevancy_score, ""),
+    completenessScore: firstText(row.eval_completeness_score, ""),
     query: firstText(row.query, ""),
     inputPreview: firstText(row.input_preview, row.input, "")
   };
@@ -219,11 +237,15 @@ function compareExampleOrder(left, right) {
 function filterExamples() {
   const orchFilter = refs.orchFilter.value || "ALL";
   const intendedFilter = refs.intendedFilter.value || "ALL";
+  const relevancyScoreFilter = refs.relevancyScoreFilter.value || "ALL";
+  const completenessScoreFilter = refs.completenessScoreFilter.value || "ALL";
 
   state.filteredExamples = state.examples.filter((example) => {
     const orchMatch = orchFilter === "ALL" || example.routeOrchValue === orchFilter;
     const intendedMatch = intendedFilter === "ALL" || example.routeIntendedValue === intendedFilter;
-    return orchMatch && intendedMatch;
+    const relevancyMatch = relevancyScoreFilter === "ALL" || example.outputRelevancyScore === relevancyScoreFilter;
+    const completenessMatch = completenessScoreFilter === "ALL" || example.completenessScore === completenessScoreFilter;
+    return orchMatch && intendedMatch && relevancyMatch && completenessMatch;
   });
 
   if (!state.filteredExamples.some((example) => example.key === state.selectedKey)) {
@@ -254,6 +276,8 @@ function renderWarnings() {
 function renderFilterControls() {
   renderRouteFilter(refs.orchFilter, state.examples.map((example) => example.routeOrchValue), "All orchestration routes");
   renderRouteFilter(refs.intendedFilter, state.examples.map((example) => example.routeIntendedValue), "All intended routes");
+  renderRouteFilter(refs.relevancyScoreFilter, state.examples.map((example) => example.outputRelevancyScore), "All output relevancy scores");
+  renderRouteFilter(refs.completenessScoreFilter, state.examples.map((example) => example.completenessScore), "All completeness scores");
 
   refs.rowSelect.textContent = "";
   if (!state.filteredExamples.length) {
