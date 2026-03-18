@@ -130,6 +130,22 @@ body {
   gap: 8px;
 }
 
+.row-select-field {
+  position: relative;
+}
+
+.field-note {
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.row-select-field .field-note {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+}
+
 .topbar-status {
   display: grid;
   grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);

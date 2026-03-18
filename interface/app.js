@@ -15,6 +15,7 @@ const refs = {
   relevancyScoreFilter: document.getElementById("relevancyScoreFilter"),
   completenessScoreFilter: document.getElementById("completenessScoreFilter"),
   rowSelect: document.getElementById("rowSelect"),
+  rowCountNote: document.getElementById("rowCountNote"),
   fileStatus: document.getElementById("fileStatus"),
   warningBox: document.getElementById("warningBox"),
   selectedMeta: document.getElementById("selectedMeta"),
@@ -278,6 +279,7 @@ function renderFilterControls() {
   renderRouteFilter(refs.intendedFilter, state.examples.map((example) => example.routeIntendedValue), "All intended routes");
   renderRouteFilter(refs.relevancyScoreFilter, state.examples.map((example) => example.outputRelevancyScore), "All output relevancy scores");
   renderRouteFilter(refs.completenessScoreFilter, state.examples.map((example) => example.completenessScore), "All completeness scores");
+  refs.rowCountNote.textContent = `${state.filteredExamples.length} row${state.filteredExamples.length === 1 ? "" : "s"} available`;
 
   refs.rowSelect.textContent = "";
   if (!state.filteredExamples.length) {
