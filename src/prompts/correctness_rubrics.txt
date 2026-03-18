@@ -1,0 +1,72 @@
+# CORRECTNESS METRIC (STATIC RUBRIC)
+
+Apply this metric only when the output contains revision suggestions.
+
+Top-level metric:
+- **Metric Name**: Correctness
+- **Metric Goal**: Assess whether the revision suggestions are structurally sound, usable, and appropriate as writing-coach edits.
+- **Metric-Level Score Scale**:
+  - `0 = Problematic`
+  - `1 = Partially Sound`
+  - `2 = Sound`
+
+Each item below is an evaluation item under the Correctness metric. Score every item on:
+- `0 = Unresolved`
+- `1 = Partially Resolved`
+- `2 = Resolved`
+
+Use these exact item names and importance labels.
+
+1. **Verbatim Copy Detection** (Importance: High)
+   - What it checks: Whether a suggestion actually revises the text rather than copying the original text back with little or no meaningful change.
+   - Score 0: `transformed_text` is identical or nearly identical to `original_text`, with no substantive revision.
+   - Score 1: The suggestion makes only superficial edits with limited practical effect.
+   - Score 2: The suggestion introduces a substantive revision rather than a trivial restatement.
+
+2. **Redundant Suggestion (Element Already Exists)** (Importance: High)
+   - What it checks: Whether the system suggests adding something that is already present in the input text.
+   - Score 0: The suggestion adds or re-adds an element already present without recognizing that it exists.
+   - Score 1: The suggestion partially recognizes existing content but still duplicates or weakly repeats it.
+   - Score 2: The suggestion does not redundantly add content that already exists, or it appropriately reframes the need as a revision.
+
+3. **Excessive Scope / Coach-Not-Author Boundary** (Importance: High)
+   - What it checks: Whether the suggestion stays within a coaching role and avoids writing large chunks of text.
+   - Score 0: The suggestion rewrites or inserts a very large block of text, effectively ghostwriting rather than coaching.
+   - Score 1: The suggestion is larger than ideal for a coaching edit but not fully excessive.
+   - Score 2: The suggestion stays appropriately bounded and avoids large-block authorship.
+
+4. **Suggestion Internal Consistency** (Importance: Medium)
+   - What it checks: Whether the explanation matches what the proposed revision actually does.
+   - Score 0: The explanation materially contradicts the proposed change.
+   - Score 1: The explanation is only partially aligned with the revision.
+   - Score 2: The explanation accurately describes the revision.
+
+5. **Suggestion Overlap / Conflict** (Importance: Medium)
+   - What it checks: Whether the suggestions are independently reviewable and avoid conflicting edit choices.
+   - Primary evidence: Use `char_start` and `char_end` span metadata first. Use text content only as a secondary check.
+   - Score 0: One or more suggestions overlap or conflict in a way that would make the set confusing or mutually incompatible in the UI.
+   - Score 1: There are minor span collisions, adjacency issues, or small conflicts that a user could still sort out manually.
+   - Score 2: The suggestions are cleanly independent and can be reviewed one by one without conflict.
+
+6. **Over-Specified Rewrite Instead of Minimal Edit** (Importance: Medium)
+   - What it checks: Whether the extent of editing matches the user's request, especially for local edits.
+   - Score 0: The suggestion clearly goes beyond the requested level of intervention.
+   - Score 1: The suggestion is somewhat over-edited relative to the request.
+   - Score 2: The extent of editing matches the user's request.
+
+7. **Missing Actionability / Low-Value Suggestion** (Importance: Medium)
+   - What it checks: Whether each suggestion provides clear, distinct coaching value.
+   - Score 0: The suggestion is low-value, redundant, or too weak to justify acceptance.
+   - Score 1: The suggestion has some value but is only weakly actionable or distinct.
+   - Score 2: The suggestion provides a distinct, useful improvement the user could reasonably accept.
+
+8. **Non-Paper-Like / Instructional Output** (Importance: High)
+   - What it checks: Whether the proposed revision reads like text that could be inserted into the paper rather than an instruction, placeholder, or editor note.
+   - Score 0: The suggestion reads like an instruction to the model, an editor note, or a template placeholder rather than document-ready prose.
+   - Score 1: The suggestion mixes usable paper text with instructional or meta-writing language.
+   - Score 2: The suggestion reads as polished prose that could plausibly be inserted into the document.
+
+Metric-level scoring guidance for Correctness:
+- `0 = Problematic`: The suggestion set shows clear structural or usability problems across multiple correctness items, or a severe failure on a high-importance item.
+- `1 = Partially Sound`: The suggestion set is partly usable but has noticeable correctness issues, inconsistencies, or boundary problems.
+- `2 = Sound`: The suggestion set is structurally sound, usable, and appropriate as a writing-coach output.

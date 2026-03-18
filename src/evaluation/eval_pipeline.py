@@ -38,7 +38,7 @@ from src.evaluation.prompt_loader import (
     build_judge_prompts,
     format_metrics_definition,
 )
-from src.constants.metrics_definitions import METRICS_DEFINITION
+from src.constants.metrics_definitions import CORRECTNESS_METRIC_NAME, METRICS_DEFINITION
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -74,6 +74,7 @@ EVAL_CSV_FIELDNAMES = [
     "timestamp",
     "output_relevancy_score",
     "completeness_score",
+    "correctness_score",
     "overall_notes",
     "generator_raw_response",
     "rubrics_json",
@@ -81,12 +82,18 @@ EVAL_CSV_FIELDNAMES = [
     "evaluation_items_json",  # evaluation_items extracted per metric from rubrics
     "judge_raw_response",
     "verdicts_json",
-    "meta_verdicts_json",
 ]
 
 METRIC_SCORE_FIELDS = {
     "output relevancy": "output_relevancy_score",
     "completeness": "completeness_score",
+    "correctness": "correctness_score",
+}
+
+SCORE_FIELD_LABELS = {
+    "output_relevancy_score": "Output Relevancy",
+    "completeness_score": "Completeness",
+    "correctness_score": CORRECTNESS_METRIC_NAME,
 }
 
 # ---------------------------------------------------------------------------
@@ -327,6 +334,14 @@ def _extract_metric_scores(evaluation: list[dict[str, Any]]) -> dict[str, int | 
     return scores
 
 
+def _required_score_fields(has_suggestions: bool) -> list[str]:
+    """Return the metric score fields expected for a given row."""
+    required = ["output_relevancy_score", "completeness_score"]
+    if has_suggestions:
+        required.append("correctness_score")
+    return required
+
+
 def _avg_std(scores: list) -> tuple[float, float]:
     """Return (mean, stdev) of scores, or (nan, 0.0) for an empty list."""
     if not scores:
@@ -339,27 +354,55 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute per-route, micro, and macro score statistics from OK-status results."""
     route_buckets: dict[str, dict[str, list]] = {}
     for r in ok_results:
-        b = route_buckets.setdefault(r["route"], {"output_relevancy_score": [], "completeness_score": []})
-        for field in ("output_relevancy_score", "completeness_score"):
+        b = route_buckets.setdefault(
+            r["route"],
+            {"row_count": 0, **{field: [] for field in SCORE_FIELD_LABELS}},
+        )
+        b["row_count"] += 1
+        for field in SCORE_FIELD_LABELS:
             if r.get(field) is not None:
                 b[field].append(r[field])
 
     per_route = {
         route: {
-            "n": len(b["output_relevancy_score"]),
+            "n": b["row_count"],
+            "counts": {field: len(b[field]) for field in SCORE_FIELD_LABELS},
             "output_relevancy": _avg_std(b["output_relevancy_score"]),
             "completeness": _avg_std(b["completeness_score"]),
+            "correctness": _avg_std(b["correctness_score"]),
         }
         for route, b in route_buckets.items()
     }
     all_rel = [s for b in route_buckets.values() for s in b["output_relevancy_score"]]
     all_comp = [s for b in route_buckets.values() for s in b["completeness_score"]]
+    all_correctness = [s for b in route_buckets.values() for s in b["correctness_score"]]
     route_rel_avgs = [_avg_std(b["output_relevancy_score"])[0] for b in route_buckets.values() if b["output_relevancy_score"]]
     route_comp_avgs = [_avg_std(b["completeness_score"])[0] for b in route_buckets.values() if b["completeness_score"]]
+    route_correctness_avgs = [_avg_std(b["correctness_score"])[0] for b in route_buckets.values() if b["correctness_score"]]
     return {
         "per_route": per_route,
-        "micro": {"n": len(all_rel), "output_relevancy": _avg_std(all_rel), "completeness": _avg_std(all_comp)},
-        "macro": {"n_routes": len(route_rel_avgs), "output_relevancy": _avg_std(route_rel_avgs), "completeness": _avg_std(route_comp_avgs)},
+        "micro": {
+            "n": len(ok_results),
+            "counts": {
+                "output_relevancy_score": len(all_rel),
+                "completeness_score": len(all_comp),
+                "correctness_score": len(all_correctness),
+            },
+            "output_relevancy": _avg_std(all_rel),
+            "completeness": _avg_std(all_comp),
+            "correctness": _avg_std(all_correctness),
+        },
+        "macro": {
+            "n_routes": len(route_buckets),
+            "counts": {
+                "output_relevancy_score": len(route_rel_avgs),
+                "completeness_score": len(route_comp_avgs),
+                "correctness_score": len(route_correctness_avgs),
+            },
+            "output_relevancy": _avg_std(route_rel_avgs),
+            "completeness": _avg_std(route_comp_avgs),
+            "correctness": _avg_std(route_correctness_avgs),
+        },
     }
 
 
@@ -536,10 +579,14 @@ def _format_output_for_judge(response_text: str, suggestions: list[dict]) -> str
         original = (s.get("original_text") or "").strip()
         transformed = (s.get("transformed_text") or "").strip()
         explanation = (s.get("explanation") or "").strip()
+        char_start = s.get("char_start")
+        char_end = s.get("char_end")
 
         block_lines = [f"#### Suggestion {i}"]
         if explanation:
             block_lines.append(f"**Purpose**: {explanation}")
+        if isinstance(char_start, int) and isinstance(char_end, int):
+            block_lines.append(f"**Span**: char_start={char_start}, char_end={char_end}")
         if original:
             block_lines.append(f"**Original Text**:\n{original}")
         else:
@@ -595,11 +642,11 @@ async def process_row(
         # Stage 2 outputs
         "judge_raw_response": None,
         "verdicts": None,
-        "meta_verdicts": None,
         "overall_notes": None,
         # Scores
         "output_relevancy_score": None,
         "completeness_score": None,
+        "correctness_score": None,
     }
 
     async with semaphore:
@@ -722,6 +769,7 @@ async def process_row(
                 input_text=row["input"],
                 output_text=output_for_judge,
                 rubrics=rubrics_str,
+                include_correctness=bool(row.get("has_suggestions")),
             )
 
             judge_response = await call_llm(
@@ -749,20 +797,18 @@ async def process_row(
             metric_scores = _extract_metric_scores(evaluation)
             result.update(metric_scores)
 
-            if any(score is None for score in metric_scores.values()):
+            required_score_fields = _required_score_fields(bool(row.get("has_suggestions")))
+            if any(result.get(field) is None for field in required_score_fields):
                 logger.warning("Row %d: Judge response missing one or more metric scores", row_id)
                 result["status"] = "JUDGE_INCOMPLETE"
                 return result
 
-            # Process meta-verdicts
-            meta_verdicts = judge_parsed.get("meta_verdicts", [])
-            result["meta_verdicts"] = meta_verdicts
-
             logger.info(
-                "Row %d: done — Output Relevancy=%s, Completeness=%s",
+                "Row %d: done — Output Relevancy=%s, Completeness=%s, Correctness=%s",
                 row_id,
                 result["output_relevancy_score"],
                 result["completeness_score"],
+                result["correctness_score"],
             )
 
         except Exception as e:
@@ -810,6 +856,7 @@ class OutputWriter:
                 "timestamp": result["timestamp"],
                 "output_relevancy_score": result["output_relevancy_score"],
                 "completeness_score": result["completeness_score"],
+                "correctness_score": result["correctness_score"],
                 "overall_notes": result["overall_notes"],
                 "generator_raw_response": result["generator_raw_response"],
                 "rubrics_json": json.dumps(result["rubrics"], ensure_ascii=False)
@@ -818,17 +865,25 @@ class OutputWriter:
                     else json.dumps(result["rubrics_reasoning"], ensure_ascii=False)
                     if result["rubrics_reasoning"] is not None else "",
                 "evaluation_items_json": json.dumps(
-                    [
-                        {"metric": r.get("metric"), "evaluation_items": r.get("evaluation_items", [])}
-                        for r in (result["rubrics"] or [])
-                    ],
+                    (
+                        [
+                            {
+                                "metric": v.get("metric_name") or v.get("criterion_name"),
+                                "evaluation_items": v.get("evaluation_items", []),
+                            }
+                            for v in (result["verdicts"] or [])
+                        ]
+                        if result["verdicts"] is not None
+                        else [
+                            {"metric": r.get("metric"), "evaluation_items": r.get("evaluation_items", [])}
+                            for r in (result["rubrics"] or [])
+                        ]
+                    ),
                     ensure_ascii=False,
                 ) if result["rubrics"] is not None else "",
                 "judge_raw_response": result["judge_raw_response"],
                 "verdicts_json": json.dumps(result["verdicts"], ensure_ascii=False)
                     if result["verdicts"] is not None else "",
-                "meta_verdicts_json": json.dumps(result["meta_verdicts"], ensure_ascii=False)
-                    if result["meta_verdicts"] is not None else "",
             })
             self._csv_file.flush()
 
@@ -1059,6 +1114,7 @@ def build_enriched_output(
         "eval_status": "status", "eval_timestamp": "timestamp",
         "eval_output_relevancy_score": "output_relevancy_score",
         "eval_completeness_score": "completeness_score",
+        "eval_correctness_score": "correctness_score",
         "eval_overall_notes": "overall_notes",
         "eval_generator_raw": "generator_raw_response",
         "eval_judge_raw": "judge_raw_response",
@@ -1066,7 +1122,6 @@ def build_enriched_output(
     _json_map = {
         "eval_rubrics_json": "rubrics",
         "eval_verdicts_json": "verdicts",
-        "eval_meta_verdicts_json": "meta_verdicts",
     }
     for col in [*_scalar_map, *_json_map]:
         df[col] = None
@@ -1096,7 +1151,7 @@ def build_enriched_output(
         for _, row in df.iterrows():
             rec = row.to_dict()
             # Parse the JSON string columns back into objects for the JSONL
-            for col in ("eval_rubrics_json", "eval_verdicts_json", "eval_meta_verdicts_json"):
+            for col in ("eval_rubrics_json", "eval_verdicts_json"):
                 v = rec.get(col)
                 if v and isinstance(v, str):
                     try:
@@ -1143,24 +1198,45 @@ def _print_summary(
             s = stats["per_route"][route]
             rel_avg, rel_std = s["output_relevancy"]
             comp_avg, comp_std = s["completeness"]
+            corr_avg, corr_std = s["correctness"]
+            correctness_text = (
+                f"  Correctness={corr_avg:.3f} (±{corr_std:.3f})"
+                if s["counts"]["correctness_score"] > 0
+                else "  Correctness=N/A"
+            )
             print(
                 f"  {route:20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
-                f"Completeness={comp_avg:.3f} (±{comp_std:.3f})  n={s['n']}"
+                f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
+                f"{correctness_text}  n={s['n']}"
             )
 
         print()
         micro, macro = stats["micro"], stats["macro"]
         rel_avg, rel_std = micro["output_relevancy"]
         comp_avg, comp_std = micro["completeness"]
+        corr_avg, corr_std = micro["correctness"]
+        micro_correctness_text = (
+            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f})"
+            if micro["counts"]["correctness_score"] > 0
+            else "  Correctness=N/A"
+        )
         print(
             f"  {'OVERALL (micro)':20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
-            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})  n={micro['n']}"
+            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
+            f"{micro_correctness_text}  n={micro['n']}"
         )
         rel_avg, rel_std = macro["output_relevancy"]
         comp_avg, comp_std = macro["completeness"]
+        corr_avg, corr_std = macro["correctness"]
+        macro_correctness_text = (
+            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f})"
+            if macro["counts"]["correctness_score"] > 0
+            else "  Correctness=N/A"
+        )
         print(
             f"  {'OVERALL (macro)':20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
-            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})  n_routes={macro['n_routes']}"
+            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
+            f"{macro_correctness_text}  n_routes={macro['n_routes']}"
         )
 
     print()
@@ -1249,8 +1325,9 @@ def _log_to_mlflow(
                 s = stats["per_route"][route]
                 prefix = route.lower()
                 mlflow.log_metric(f"{prefix}_n", s["n"])
-                if s["n"] > 0:
-                    for metric in ("output_relevancy", "completeness"):
+                for metric in ("output_relevancy", "completeness", "correctness"):
+                    score_field = f"{metric}_score"
+                    if s["counts"].get(score_field, 0) > 0:
                         avg, std = s[metric]
                         mlflow.log_metric(f"{prefix}_{metric}_avg", avg)
                         mlflow.log_metric(f"{prefix}_{metric}_std", std)
@@ -1258,7 +1335,10 @@ def _log_to_mlflow(
             for level, n_key in (("micro", "n"), ("macro", "n_routes")):
                 ls = stats[level]
                 if ls[n_key] > 0:
-                    for metric in ("output_relevancy", "completeness"):
+                    for metric in ("output_relevancy", "completeness", "correctness"):
+                        score_field = f"{metric}_score"
+                        if ls["counts"].get(score_field, 0) == 0:
+                            continue
                         avg, std = ls[metric]
                         mlflow.log_metric(f"{level}_{metric}_avg", avg)
                         mlflow.log_metric(f"{level}_{metric}_std", std)

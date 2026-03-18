@@ -22,7 +22,7 @@ Route prompts may include a shared ``UNIVERSAL`` block plus a route-specific blo
 from pathlib import Path
 from typing import Tuple
 
-from src.constants.metrics_definitions import METRICS_DEFINITION
+from src.constants.metrics_definitions import CORRECTNESS_METRIC_NAME, METRICS_DEFINITION
 from src.constants.route_prompts import ROUTE_PROMPTS
 from src.constants.route_constraints import ROUTE_CONSTRAINTS
 
@@ -51,7 +51,7 @@ def load_prompt(filename: str) -> str:
     """Load a plain prompt/config file from the prompts directory.
 
     Args:
-        filename: Name of the file (e.g., 'meta_rubrics.txt').
+        filename: Name of the file (e.g., 'correctness_rubrics.txt').
 
     Returns:
         File content as a stripped string.
@@ -294,7 +294,8 @@ def build_judge_prompts(
     input_text: str,
     output_text: str,
     rubrics: str,
-    meta_rubrics: str | None = None,
+    include_correctness: bool = False,
+    correctness_rubrics: str | None = None,
 ) -> Tuple[str, str]:
     """Build system and user prompts for the rubrics judge LLM.
 
@@ -302,36 +303,79 @@ def build_judge_prompts(
     all dynamic slots.
 
     Slots filled in the system block (``{% block system %}``):
-        - ``{meta_rubrics}``: meta-level rubrics criteria
+        - ``{correctness_rubrics}``: fixed Correctness metric criteria
 
     Slots filled in the user block (``{% block prompt %}``):
         - ``{user_query}``: the user's instruction
         - ``{input_text}``: the document text
         - ``{output_text}``: the system's generated output to evaluate
         - ``{rubrics}``: JSON string of rubrics from Stage 1
+        - ``{correctness_task_note}``: route-specific instruction for Correctness
+        - ``{correctness_metric_schema}``: optional JSON schema block for Correctness
 
     Args:
         user_query: The user's instruction/query.
         input_text: The document text the user is working on.
         output_text: The system's generated output to evaluate.
         rubrics: JSON string of generated rubrics from Stage 1.
-        meta_rubrics: Override for meta-rubrics content.
-            If None, loaded from ``src/prompts/meta_rubrics.txt``.
+        include_correctness: Whether the output contains revision suggestions and
+            should therefore be evaluated on the static Correctness metric.
+        correctness_rubrics: Override for correctness rubric content.
+            If None and ``include_correctness`` is True, loaded from
+            ``src/prompts/correctness_rubrics.txt``.
 
     Returns:
         Tuple of (system_prompt, user_prompt) ready to send to the LLM.
     """
-    if meta_rubrics is None:
-        try:
-            meta_rubrics = load_prompt("meta_rubrics.txt")
-        except FileNotFoundError:
-            meta_rubrics = "(No meta-rubrics defined)"
+    if include_correctness:
+        if correctness_rubrics is None:
+            correctness_rubrics = load_prompt("correctness_rubrics.txt")
+        correctness_task_note = (
+            f"5. **Correctness Rubric**: a fixed set of evaluation items under the top-level "
+            f"metric `{CORRECTNESS_METRIC_NAME}`. Because this output contains revision suggestions, "
+            f"you must return a third metric-level evaluation for Correctness."
+        )
+        correctness_metric_schema = """
+    ,
+    {
+      "metric_name": "Correctness",
+      "score": integer (0-2),
+      "level": "Problematic|Partially Sound|Sound",
+      "reasoning": "Explanation of why this score was assigned, referencing the fixed correctness evaluation items and evidence from the output_text.",
+      "evaluation_items": [
+        {
+          "item_name": "Exact name of the correctness evaluation item",
+          "importance": "High|Medium|Low",
+          "score": integer (0-2),
+          "level": "Unresolved|Partially Resolved|Resolved",
+          "reasoning": "Brief justification grounded in specific evidence from the output text."
+        }
+      ],
+      "item_resolution_summary": {
+        "total_items": integer,
+        "unresolved_count": integer,
+        "partially_resolved_count": integer,
+        "resolved_count": integer,
+        "unresolved_pct": float (0-100),
+        "partially_resolved_pct": float (0-100),
+        "resolved_pct": float (0-100)
+      }
+    }"""
+    else:
+        correctness_rubrics = (
+            f"Correctness is not applicable for this evaluation because the output does not contain "
+            f"revision suggestions. Do not return a `{CORRECTNESS_METRIC_NAME}` metric."
+        )
+        correctness_task_note = (
+            f"5. **Correctness Rubric**: not applicable for this output. Do not return a `{CORRECTNESS_METRIC_NAME}` metric."
+        )
+        correctness_metric_schema = ""
 
     system_template, user_template = load_combined_prompt("rubrics_judge_prompt.txt")
 
     system_prompt = _safe_format(
         system_template,
-        meta_rubrics=meta_rubrics,
+        correctness_rubrics=correctness_rubrics,
     )
     user_prompt = _safe_format(
         user_template,
@@ -339,6 +383,8 @@ def build_judge_prompts(
         input_text=input_text,
         output_text=output_text,
         rubrics=rubrics,
+        correctness_task_note=correctness_task_note,
+        correctness_metric_schema=correctness_metric_schema,
     )
 
     return system_prompt, user_prompt
