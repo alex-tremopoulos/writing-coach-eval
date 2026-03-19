@@ -53,6 +53,13 @@
           </select>
         </div>
 
+        <div class="toolbar-field">
+          <label class="field-label" for="correctnessScoreFilter">Correctness Score</label>
+          <select id="correctnessScoreFilter" class="filter-input">
+            <option value="ALL">All correctness scores</option>
+          </select>
+        </div>
+
         <div class="toolbar-field row-select-field">
           <label class="field-label" for="rowSelect">Row ID</label>
           <select id="rowSelect" class="filter-input">
@@ -136,6 +143,18 @@
             </div>
           </div>
           <div class="scroll-block" id="completenessBlock"></div>
+        </article>
+      </section>
+
+      <section class="viewer-row one-column">
+        <article class="panel content-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Scoring</p>
+              <h2>Correctness</h2>
+            </div>
+          </div>
+          <div class="scroll-block" id="correctnessBlock"></div>
         </article>
       </section>
     </main>

@@ -26,19 +26,38 @@ You understand that academic text editing involves not just surface-level correc
 
 {% block prompt %}
 # TASK
-Your task is to build a detailed, dynamic rubrics for evaluating AI responses to user commands in a writing coach system. The system routes user commands to different processing routes based on task type. You must create rubrics that:
+Build dynamic rubrics for evaluating an AI writing-coach response. The system routes user commands to different processing routes based on task type. Your rubrics must:
 
 1. **Align with the specified metrics** (ONLY include quality dimensions covered by the metrics)
 2. **Address all user intents** from the command (explicit and implicit) through the lens of the metrics
-3. **Are grounded in the actual input text** (define criteria for relevant, observable changes)
-4. **Respect the route's capabilities** (define criteria for what the route is designed to do)
+3. **Are grounded in the actual input text** (define rubric items for relevant, observable changes)
+4. **Respect the route's capabilities** (define rubric items for what the route is designed to do)
 5. **Incorporate the route prompt's guidance** (align with how the agent should behave)
-6. **Apply route-specific constraints** (required criteria, exclusions, priorities)
+6. **Apply route-specific constraints** (required rubric items, exclusions, priorities)
 
-**Critical**: The metrics define WHAT aspects to include in the rubrics. User intents, input text, and route capabilities define HOW to structure the evaluation criteria. Your rubrics must balance all inputs, with metrics serving as the primary filter for criterion selection.
+**Critical**: Metrics define WHAT to evaluate. User intent, input text, route capabilities, and route guidance define HOW each metric-level rubric and its evaluation items should be structured.
+
+**Instruction Priority (highest to lowest)**:
+1. Metrics scope and exclusions
+2. Route capabilities and route prompt constraints
+3. User command intents
+4. Input text realities and observable issues
+5. Output format requirements
+
+**Output Constraints**:
+- Return only the final rubrics in the required format
+- Do not include analysis, hidden reasoning, planning notes, or restatements of the instructions
+- Create exactly one top-level rubric per provided metric
+- The number of top-level rubrics must equal the number of metrics
+- Treat every provided metric as high importance
+- Group multiple evaluation items under a metric-specific rubric when needed
+- Allow evaluation items within a metric to have different importance levels when justified
+- Keep each rubric description brief (2-3 sentences)
+- Keep each evaluation item description brief (1-2 sentences when possible)
+- Keep observable indicators concrete and concise
 
 ## ROUTING CONTEXT
-The system uses an agentic orchestrator that routes commands to one of four routes:
+The system uses an orchestrator that routes commands to one of four routes:
 
 **1. RESEARCH** — Find/explore literature, return papers with citations
 - Examples: "Find papers about X", "What does the literature say?"
@@ -65,32 +84,25 @@ The system uses an agentic orchestrator that routes commands to one of four rout
 - **RESPOND route**: Generate new text without modifying input
 - **RESEARCH route**: Return literature, no text generation or editing
 
-# RUBRICS DEFINITION
-A rubrics is a structured evaluation framework consisting of:
-- **Criteria**: Specific aspects of the task to assess (e.g., "Grammar Correction Completeness", "Citation Relevance")
-  - Each criterion must map to the specified metric
-- **Performance Levels**: Typically 4 levels from Poor (1) to Excellent (4)
-- **Indicators**: Observable evidence that would define each performance level
+# CORE DEFINITIONS
+- **Metric-Level Rubric**: One top-level rubric per provided metric. Each top-level rubric must correspond to exactly one metric.
+- **Evaluation Items**: Sub-aspects assessed within a metric-level rubric. Each item must stay within the scope of its parent metric.
+- **Performance Levels**: Metric-specific levels on a fixed `0-2` scale.
+- **Indicators**: Observable evidence that defines each score level.
 
-The rubrics you create must be:
-- **Metrics-aligned**: All criteria must correspond to specified evaluation metrics; no criteria outside metric scope
-- **Specific**: Tailored to the exact user command + input text + route + metrics combination
-- **Measurable**: Based on observable, objective indicators that assess the specified metrics
-- **Comprehensive within scope**: Cover all aspects of the user's request that align with specified metrics
-- **Fair**: Include only what the route is designed to accomplish and what metrics define as important
+Your rubrics must be metrics-aligned, specific to the command and input, measurable, grounded, and limited to what the selected route can actually do.
 
 # INPUT DEFINITIONS
 
 ## USER COMMAND
 The specific instruction provided by the user that triggered the system response.
 
-**Purpose in Rubrics Generation**:
-- **Extract all user intents**: Decompose compound requests (e.g., "fix grammar and improve clarity" = 2 intents)
-- **Identify priorities**: Which aspects are primary vs. secondary?
-- **Detect implicit requirements**: What must be preserved? (meaning, tone, terminology)
-- **Determine success criteria**: What would satisfy the user?
+**Use it to**:
+- extract all explicit and implicit intents
+- identify what is primary versus secondary
+- note what must be preserved, such as meaning, tone, terminology, or structure
 
-**Examples by Route**:
+**Examples by route**:
 - RESEARCH: "Find recent papers on climate change mitigation"
 - REVISE_RESEARCH: "Add citations to support the methodology claims"
 - REVISE_SIMPLE: "Fix grammatical errors and improve sentence flow"
@@ -99,228 +111,128 @@ The specific instruction provided by the user that triggered the system response
 ## INPUT TEXT
 The original manuscript or text content provided by the user.
 
-**Purpose in Rubrics Generation**:
-- **Identify actual issues**: What problems exist that need addressing? (grammar errors, unclear passages, unsupported claims)
-- **Understand context**: Domain, document type, writing style
-- **Assess scope**: How much work is needed? Localized fixes vs. systemic issues?
-- **Determine what to preserve**: What elements should remain unchanged?
+**Use it to**:
+- identify real issues the command refers to
+- understand domain, document type, style, and scope
+- determine what should remain unchanged
 
-**Critical For**: Ensuring rubrics criteria and indicators are grounded in the ACTUAL text provided, not hypothetical issues.
+**Critical Input Text Handling**:
+- Treat `input_text` as the original source text supplied by the user
+- Do not interpret `input_text` as already revised, already improved, or as the model's output
+- For REVISE routes, define rubric items for suggested edits or modifications that should be made to the original input text
+- For RESPOND and RESEARCH routes, use the input text as context, not as text to be treated as already modified
+- Any suggested edits, issues, or opportunities referenced in the rubrics must be traceable to the input text or the user command
 
 ## METRICS DEFINITION
-The specific evaluation metrics provided dynamically for this task. Each metric includes a name and description that defines a particular quality dimension to assess. Metrics are the lens through which the AI response will be evaluated when someone uses this rubrics.
-
-**Purpose in Rubrics Generation**:
-- **Drive criterion selection**: Only create rubrics criteria that align with the provided metrics
-- **Filter irrelevant aspects**: Even if the user command implies certain work, don't include criteria for aspects not covered by the metrics
-- **Focus evaluation scope**: Each metric's description defines what aspect of quality matters for evaluation
-- **Shape performance indicators**: Design indicators that would measure the specific quality aspects defined by each metric's description
+The provided metrics define the evaluation scope.
 
 **Important Notes**:
-- **Metrics define WHAT to include in rubrics, not HOW to score**: The metrics guide which aspects of the response should be in the rubrics (e.g., correctness, completeness, appropriateness), but the rubrics uses its own 4-level scoring system (Poor/Fair/Good/Excellent)
-- **One metric can map to multiple criteria**: A single metric may require several rubrics criteria to fully cover its quality dimension
-- **Read metric descriptions carefully**: The description explains the specific aspect of quality to design criteria for
+- Create exactly one top-level rubric per metric
+- Keep every top-level metric rubric high priority unless the input explicitly says otherwise
+- Use evaluation-item importance only within a metric-level rubric
+- Do not add rubric dimensions outside the provided metrics
+- Metrics define **WHAT** to evaluate; user intent, input text, and route define **HOW** to structure each rubric
 
-**Critical**: The rubrics should ONLY include criteria for aspects covered by the provided metrics. Don't create criteria for quality dimensions not specified in the metrics, even if they seem relevant to the task.
+**Current Metrics in Use**:
+- **Output Relevancy**: Whether the output or edit suggestions directly address the user command and reflect the user's intent
+- **Completeness**: Whether the output covers all required parts of the user's request without omitting critical elements
+
+**Scoring Scheme**:
+- **Output Relevancy**: `0 = Irrelevant`, `1 = Partially Relevant`, `2 = Completely Relevant`
+- **Completeness**: `0 = Incomplete`, `1 = Adequate`, `2 = Comprehensive`
 
 ## ROUTE PROMPT
-The system prompt given to the AI agent executing the selected route. This defines:
-- **Agent role and capabilities**: What the agent can do
-- **Expected behaviors**: How the agent should approach tasks
-- **Output format**: Structure and style of responses
-- **Quality guidelines**: Standards for good performance
-- **Constraints and priorities**: What to emphasize or avoid
-
-**Purpose in Rubrics Generation**:
-- **Define the action space**: What types of outputs are within scope?
-- **Set behavioral expectations**: How should the agent behave?
-- **Identify route-specific quality standards**: What distinguishes excellent from poor performance for this route?
-- **Understand design intent**: Why was this route designed this way?
-
-**Example**: A REVISE_SIMPLE route prompt might emphasize "preserve author voice" and "suggest minimal necessary changes", while REVISE_RESEARCH might prioritize "integrate citations smoothly" and "find high-quality sources".
+Use the route prompt to define:
+- the allowed action space
+- behavioral expectations
+- route-specific quality standards
+- route-specific constraints or priorities that should shape the rubrics
 
 # EXPECTED OUTPUT
-Generate a comprehensive rubrics in the following structured format:
+Generate comprehensive rubrics in the following structured format:
 
 ## Rubrics for: [Brief description of the task]
 **User Command**: [Restate the command]
 **Route**: [Route name]
 **Input Text Context**: [1-2 sentence summary of input text characteristics]
+**Metrics Covered**: [List the metric names; number of top-level rubrics must match this count]
 
 ---
 
-### Criterion 1: [Name of first evaluation criterion]
-**Description**: Brief explanation of what this criterion assesses and why it matters for this task
-**Linked to**: [User intent or route requirement this addresses]
-**Weight**: [If applicable: High/Medium/Low priority]
+### Metric Rubric 1: [Metric name]
+**Description**: Brief explanation of what this metric-level rubric assesses and why it matters for this task
+**Linked to**: [Metric + user intent(s) or route requirement(s) this rubric addresses]
+**Metric Importance**: High
+**Evaluation Items**:
+- [Item 1: specific sub-aspect evaluated under this metric] (Importance: High/Medium/Low)
+- [Item 2: specific sub-aspect evaluated under this metric] (Importance: High/Medium/Low)
+- [Add more items only when needed to fully cover this metric within scope]
 
 | Level | Score | Description | Observable Indicators |
 |-------|-------|-------------|----------------------|
-| Excellent | 4 | [Specific description of excellent performance for this criterion] | [Concrete, observable evidence. Reference actual input text where relevant] |
-| Good | 3 | [Specific description of good performance] | [Observable evidence with specific thresholds] |
-| Fair | 2 | [Specific description of fair performance] | [Observable evidence indicating partial success] |
-| Poor | 1 | [Specific description of poor performance] | [Observable evidence of failure or problems] |
+| [Metric-specific top level, e.g. Completely Relevant or Comprehensive] | 2 | [Specific description of fully satisfactory performance for this metric-level rubric] | [Concrete, observable evidence covering the evaluation items for this metric. Reference actual input text where relevant] |
+| [Metric-specific middle level, e.g. Partially Relevant or Adequate] | 1 | [Specific description of partially satisfactory performance] | [Observable evidence showing partial success with clear gaps] |
+| [Metric-specific low level, e.g. Irrelevant or Incomplete] | 0 | [Specific description of unsatisfactory performance] | [Observable evidence of failure, irrelevance, or major omissions] |
 
-### Criterion 2: [Name of second evaluation criterion]
-[Same structure as Criterion 1]
+### Metric Rubric 2: [Metric name]
+[Same structure as Metric Rubric 1]
 
-### Criterion 3: [Name of third evaluation criterion]
+### Metric Rubric 3: [Metric name]
 [Same structure as above]
 
-[Continue for all relevant criteria - typically 3-7 criteria]
+[Continue until every provided metric has exactly one top-level rubric]
 
 ---
 
 ### Overall Assessment Guidelines
 
-**Total Possible Score**: [Sum of all criteria scores]
+**Metric Score Interpretation**:
+- **Output Relevancy**: `0` = output is irrelevant; `1` = output is partially relevant; `2` = output is completely relevant
+- **Completeness**: `0` = output is incomplete; `1` = output is adequate; `2` = output is comprehensive
 
-**Score Interpretation**:
-- [High range]: Excellent - Fully addresses user command with high quality
-- [Mid-high range]: Good - Substantially addresses user command, minor improvements possible
-- [Mid-low range]: Fair - Partially addresses user command, significant gaps
-- [Low range]: Poor - Fails to adequately address user command
-
-**Priority Criteria**: [List which criteria are most critical for this specific task and why]
+**Priority Metrics**: [State that all metric-level rubrics are high priority; briefly note if some evaluation items within them are lower priority]
 
 **Route-Specific Notes**: [Any special considerations based on the route's design and capabilities]
 
-**Trade-offs to Consider**: [If applicable: tensions between criteria, e.g., brevity vs. completeness]
+**Trade-offs to Consider**: [If applicable: tensions between metric-level rubrics, e.g., brevity vs. completeness]
 
-# INSTRUCTIONS FOR RUBRICS GENERATION
+Return only the completed rubrics. Do not add prefatory text, analysis, or commentary outside this structure.
 
-Follow this systematic approach to create dynamic, context-aware rubrics:
+# GUARDRAILS
+- Never create top-level rubrics for quality dimensions outside the provided metrics
+- Never create more than one top-level rubric for the same metric
+- Never treat `input_text` as if it were already revised output
+- Never evaluate hypothetical edits that are not grounded in the input text, user command, or route prompt
+- Never include expectations that exceed the selected route's capabilities
+- Never output chain-of-thought, planning notes, or extra explanation outside the requested rubrics
+- **Citation Evaluation Exclusion**: Do not create evaluation items that require accessing or verifying the content of the actual cited papers. The evaluation pipeline cannot retrieve or read referenced papers, so any rubric item that checks whether a citation accurately supports a specific claim or whether a cited paper is appropriate for the context must be excluded. Citation-presence items (e.g., "does the output include at least one citation?") are permissible only if they do not require inspecting paper content.
 
-## Step 1: Decompose the User Command
-- **Extract all user intents**: Break down compound requests
-  - Example: "fix grammar and improve clarity" → Intent 1: Grammar correction, Intent 2: Clarity enhancement
-- **Identify priority**: Which aspects are most critical?
-- **Detect implicit requirements**: What does success require even if unstated?
-  - Example: "make concise" implicitly requires preserving meaning
-- **Note specificity**: Specific ("fix subject-verb agreement") vs. broad ("improve writing")
+# RUBRICS GENERATION RULES
 
-## Step 2: Identify Evaluation Metrics
-- **List all provided metrics**: What quality dimensions are specified in the metrics_definition input?
-- **Read each metric description carefully**: What specific aspect of quality does each metric focus on?
-- **Understand metric scope in context**: How does each metric apply to this specific user command and input text?
-  - A metric about "correctness" might mean grammar correctness for editing tasks, or factual correctness for research tasks
-- **Identify coverage boundaries**: What aspects of the task ARE covered by metrics? What aspects are NOT covered (and thus should not be included in the rubrics)?
-- **Map metrics to rubrics design**: For each metric, determine what observable aspects should be measured in the rubrics
+Use this workflow:
 
-## Step 3: Analyze the Input Text
-- **Document characteristics**: Type, domain, length, style
-- **Identify actual issues**: What problems exist that the command should address?
-  - Count specific errors if applicable (e.g., "5 grammar errors", "3 unsupported claims")
-- **Assess scope**: Localized issues or systemic problems?
-- **Note preservation needs**: Elements that must remain unchanged
-- **Link to metrics**: Which identified issues are relevant to the specified metrics?
+1. **Extract intents from the user command**: include explicit requests and key implicit requirements such as preservation of meaning, tone, or terminology.
+2. **Use metrics as the primary filter**: create exactly one top-level rubric per metric and exclude any dimension not covered by the provided metrics.
+3. **Ground the rubrics in the input text**: evaluation items and indicators must be traceable to real issues, claims, constraints, or opportunities in the input text.
+4. **Respect route scope**: only include expectations the selected route can satisfy.
+5. **Map intents into evaluation items under each metric**: group related sub-aspects under the relevant metric-level rubric instead of creating extra top-level rubrics.
+6. **Use the fixed scoring scheme**:
+   - **Output Relevancy**: `0 = Irrelevant`, `1 = Partially Relevant`, `2 = Completely Relevant`
+   - **Completeness**: `0 = Incomplete`, `1 = Adequate`, `2 = Comprehensive`
+7. **Make indicators observable**: use concrete evidence and thresholds where possible.
 
-## Step 4: Understand the Route's Action Space
-- **Review route prompt**: What is the agent instructed to do?
-- **Map route capabilities** to user intent:
-  - RESEARCH: Can only search literature
-  - REVISE_RESEARCH: Can edit text + search literature
-  - REVISE_SIMPLE: Can only edit text
-  - RESPOND: Can only generate new text (not edit existing)
-- **Identify route-specific quality standards**: What makes a "good" response for this route?
-- **Check alignment**: Can this route fulfill the user's request?
+**Compact mapping logic**:
+- If the user asks to fix grammar, **Output Relevancy** should focus on whether the edits target the requested grammar issues, while **Completeness** should focus on whether all major requested issues are covered.
+- If the user asks to add citations, **Output Relevancy** should focus on whether the sources support the targeted claims, while **Completeness** should focus on whether all major unsupported claims within scope are covered.
+- If a quality dimension is not in the provided metrics, exclude it even if it seems useful.
 
-## Step 5: Apply Route Rubrics Constraints
-- **Include required criteria**: Check if specific aspects must be included in the rubrics
-- **Respect exclusions**: Don't include criteria for capabilities the route doesn't have
-- **Honor scope boundaries**: Include criteria only for what the route should do
-- **Use preferred scoring**: Apply specified scale and interpretation
-
-## Step 6: Map User Intents to Evaluation Criteria (Filtered by Metrics)
-For each user intent from Step 1, create corresponding criteria ONLY if they align with the metrics from Step 2:
-
-**Mapping Logic**:
-```
-User Intent + Relevant Metrics → Evaluation Criterion (or multiple criteria)
-
-Intent: "Fix grammar"
-+ Metric focusing on "correctness" → Criterion: "Grammar Correction Accuracy"
-+ Metric focusing on "completeness" → Criterion: "Grammar Correction Completeness"
-+ NO metric on "impact" → EXCLUDE: "Grammar Improvement Impact"
-
-Intent: "Add citations"
-+ Metric focusing on "relevance" → Criterion: "Citation Relevance"
-+ Metric focusing on "quality" → Criterion: "Citation Quality"
-+ NO metric on "integration" → EXCLUDE: "Citation Integration Smoothness"
-```
-
-**Critical Grounding Principles**:
-- **Each criterion must map to a specified metric**: Don't create criteria for aspects not covered by the metrics, even if the user intent implies them
-- **Metrics determine rubrics scope**: If a metric description focuses on one aspect (e.g., "correctness"), don't include criteria for other aspects (e.g., "improvement impact")
-- **One metric may need multiple criteria**: A metric about "quality of suggestions" might require criteria for accuracy, relevance, and appropriateness
-- **Ground in inputs**: Each criterion should reference: user intent + relevant metric + input text reality + route capability
-
-## Step 7: Construct Performance Levels (Independent of Metrics Scoring)
-For each criterion, define 4 levels with specific, observable indicators that assess the quality dimension described by the relevant metric:
-
-**Critical**: The rubrics uses its own scoring system (Poor=1, Fair=2, Good=3, Excellent=4). The metrics define WHAT to measure, NOT the scoring scale.
-
-**Guidelines**:
-- **Align indicators with metric descriptions**: Ensure what you're measuring matches the quality aspect described by the metric
-  - If a metric describes "correctness of suggestions", indicators should assess whether suggestions are correct
-  - If a metric describes "completeness of coverage", indicators should assess whether all relevant aspects are addressed
-  - If a metric describes "appropriateness for context", indicators should assess contextual fit
-
-- **Be specific**: Reference actual input text characteristics
-  - ✅ "Corrects 4-5 of the 5 grammatical errors"
-  - ❌ "Corrects most errors"
-
-- **Be observable**: Define indicators that a judge can objectively assess based on what the metric describes
-  - ✅ "Adds 3-4 citations from peer-reviewed sources"
-  - ❌ "Citations are good quality"
-
-- **Be fair**: Align with route capabilities
-  - ✅ Include indicators for actions within the route's capability
-  - ❌ Don't include indicators for actions the route cannot perform (e.g., don't expect literature search from a route that only edits text)
-
-- **Differentiate clearly**: Each level should be distinct
-
-**Performance Level Structure** (use this 4-level scale for defining rubrics):
-- **Excellent (4)**: Define what fully achieving the quality dimension described by the metric looks like
-- **Good (3)**: Define what substantially achieving the quality dimension looks like, with minor gaps only
-- **Fair (2)**: Define what partially achieving the quality dimension looks like, with significant gaps
-- **Poor (1)**: Define what failing to achieve the quality dimension or introducing problems looks like
-
-## Step 8: Validate Rubrics Completeness
-
-Use this checklist:
-- [ ] **All provided metrics covered**: Each metric has at least one criterion that addresses its quality dimension
-- [ ] **No out-of-scope criteria**: All criteria map to the quality dimensions described by provided metrics
-- [ ] **All user intents covered** (within metric scope): Each part of the command has criteria, filtered through metrics
-- [ ] **Grounded in input text**: Criteria reference actual issues/characteristics
-- [ ] **Route-aligned**: Criteria match route's designed capabilities
-- [ ] **Route prompt incorporated**: Agent's instructions reflected in expectations
-- [ ] **Constraints respected**: Required criteria included, exclusions honored
-- [ ] **Criteria independent**: Minimal overlap between criteria
-- [ ] **Indicators measure metric dimensions**: Observable indicators assess what the metric descriptions specify
-- [ ] **Levels distinct**: Clear boundaries between performance levels
-- [ ] **Scoring independent**: Using 4-level rubrics scoring (1-4), not importing metric scoring
-- [ ] **Actionable**: Enables consistent evaluation by different judges
-
-## Step 9: Add Overall Assessment Guidance
-- **Prioritize criteria**: Which matter most for THIS specific command/text combination?
-- **Note trade-offs**: Any tensions? (e.g., "conciseness" vs. "adding citations")
-- **Provide score interpretation**: What ranges indicate satisfactory performance?
-- **Add route-specific context**: Special considerations for this route
-
----
-
-## Key Principles
-
-1. **Metrics-driven focus**: Provided metrics define WHICH quality dimensions to include; rubrics criteria must align with these dimensions
-2. **Metrics describe, rubrics score**: Metrics specify WHAT to assess (e.g., "correctness", "completeness"); rubrics provide HOW to score (4-level scale)
-3. **Dynamic, not generic**: Rubrics are tailored to the specific user command + input text + route + metrics combination
-4. **Route-aware**: Respect different route capabilities and quality standards
-5. **Intent-driven (filtered by metrics)**: Every user intent maps to rubrics criteria, but only for dimensions covered by metrics
-6. **Grounded**: Reference actual input text issues and characteristics
-7. **Observable**: Use concrete, measurable indicators that assess what metrics describe
-8. **Fair**: Include criteria for what the route is designed to do and what metrics specify, not what it cannot do
-9. **Comprehensive within scope**: Cover all provided metrics and user intents, but nothing beyond the metric scope
+Checklist before finalizing:
+- Every provided metric has exactly one top-level rubric
+- All user intents are covered within metric scope
+- No rubric or item exceeds route capabilities
+- All indicators are grounded, distinct, and measurable
+- The score levels clearly match the fixed `0-2` metric-specific definitions
+- Final output matches the required format exactly
 
 ---
 

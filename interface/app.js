@@ -1,4 +1,4 @@
-const METRIC_ORDER = ["Output Relevancy", "Completeness"];
+const METRIC_ORDER = ["Output Relevancy", "Completeness", "Correctness"];
 
 const state = {
   examples: [],
@@ -14,6 +14,7 @@ const refs = {
   intendedFilter: document.getElementById("intendedFilter"),
   relevancyScoreFilter: document.getElementById("relevancyScoreFilter"),
   completenessScoreFilter: document.getElementById("completenessScoreFilter"),
+  correctnessScoreFilter: document.getElementById("correctnessScoreFilter"),
   rowSelect: document.getElementById("rowSelect"),
   rowCountNote: document.getElementById("rowCountNote"),
   fileStatus: document.getElementById("fileStatus"),
@@ -24,6 +25,7 @@ const refs = {
   routeGrid: document.getElementById("routeGrid"),
   relevancyBlock: document.getElementById("relevancyBlock"),
   completenessBlock: document.getElementById("completenessBlock"),
+  correctnessBlock: document.getElementById("correctnessBlock"),
   scoreStrip: document.getElementById("scoreStrip"),
   overallNotesBlock: document.getElementById("overallNotesBlock")
 };
@@ -64,6 +66,13 @@ refs.relevancyScoreFilter.addEventListener("change", () => {
 });
 
 refs.completenessScoreFilter.addEventListener("change", () => {
+  filterExamples();
+  renderStatus();
+  renderFilterControls();
+  renderSelectedExample();
+});
+
+refs.correctnessScoreFilter.addEventListener("change", () => {
   filterExamples();
   renderStatus();
   renderFilterControls();
@@ -210,6 +219,7 @@ function finalizeExample(row, index) {
     routeIntendedValue: normalizeRouteValue(firstText(row.route_intended, getRouteName(row))),
     outputRelevancyScore: firstText(row.eval_output_relevancy_score, ""),
     completenessScore: firstText(row.eval_completeness_score, ""),
+    correctnessScore: firstText(row.eval_correctness_score, ""),
     query: firstText(row.query, ""),
     inputPreview: firstText(row.input_preview, row.input, "")
   };
@@ -240,13 +250,15 @@ function filterExamples() {
   const intendedFilter = refs.intendedFilter.value || "ALL";
   const relevancyScoreFilter = refs.relevancyScoreFilter.value || "ALL";
   const completenessScoreFilter = refs.completenessScoreFilter.value || "ALL";
+  const correctnessScoreFilter = refs.correctnessScoreFilter.value || "ALL";
 
   state.filteredExamples = state.examples.filter((example) => {
     const orchMatch = orchFilter === "ALL" || example.routeOrchValue === orchFilter;
     const intendedMatch = intendedFilter === "ALL" || example.routeIntendedValue === intendedFilter;
     const relevancyMatch = relevancyScoreFilter === "ALL" || example.outputRelevancyScore === relevancyScoreFilter;
     const completenessMatch = completenessScoreFilter === "ALL" || example.completenessScore === completenessScoreFilter;
-    return orchMatch && intendedMatch && relevancyMatch && completenessMatch;
+    const correctnessMatch = correctnessScoreFilter === "ALL" || example.correctnessScore === correctnessScoreFilter;
+    return orchMatch && intendedMatch && relevancyMatch && completenessMatch && correctnessMatch;
   });
 
   if (!state.filteredExamples.some((example) => example.key === state.selectedKey)) {
@@ -279,6 +291,7 @@ function renderFilterControls() {
   renderRouteFilter(refs.intendedFilter, state.examples.map((example) => example.routeIntendedValue), "All intended routes");
   renderRouteFilter(refs.relevancyScoreFilter, state.examples.map((example) => example.outputRelevancyScore), "All output relevancy scores");
   renderRouteFilter(refs.completenessScoreFilter, state.examples.map((example) => example.completenessScore), "All completeness scores");
+  renderRouteFilter(refs.correctnessScoreFilter, state.examples.map((example) => example.correctnessScore), "All correctness scores");
   refs.rowCountNote.textContent = `${state.filteredExamples.length} row${state.filteredExamples.length === 1 ? "" : "s"} available`;
 
   refs.rowSelect.textContent = "";
@@ -343,8 +356,10 @@ function renderNoSelection() {
   refs.routeGrid.appendChild(buildPlaceholder("Route outputs will appear here."));
   refs.relevancyBlock.textContent = "";
   refs.completenessBlock.textContent = "";
+  refs.correctnessBlock.textContent = "";
   refs.relevancyBlock.appendChild(buildPlaceholder("Output Relevancy details will appear here."));
   refs.completenessBlock.appendChild(buildPlaceholder("Completeness details will appear here."));
+  refs.correctnessBlock.appendChild(buildPlaceholder("Correctness details will appear here."));
   refs.scoreStrip.textContent = "";
   setFormattedContent(refs.overallNotesBlock, "No evaluation summary is available yet.");
 }
@@ -443,20 +458,23 @@ function renderScoring(example) {
   const evalRow = pickEvaluationRow(example);
   const rubrics = getRubrics(evalRow);
   const verdicts = getVerdicts(evalRow);
-  const rubricGroups = rubrics.length ? buildRubricGroups(rubrics) : [];
+  const rubricGroups = buildRubricGroups(rubrics, verdicts);
 
   refs.relevancyBlock.textContent = "";
   refs.completenessBlock.textContent = "";
+  refs.correctnessBlock.textContent = "";
 
   if (!rubricGroups.length) {
     refs.relevancyBlock.appendChild(buildPlaceholder("No Output Relevancy payload is available in the selected row."));
     refs.completenessBlock.appendChild(buildPlaceholder("No Completeness payload is available in the selected row."));
+    refs.correctnessBlock.appendChild(buildPlaceholder("No Correctness payload is available in the selected row."));
     return;
   }
 
   const groupsByMetric = new Map(rubricGroups.map((group) => [normalizeComparisonText(group.name), group]));
   renderScoringMetricColumn(refs.relevancyBlock, groupsByMetric.get(normalizeComparisonText("Output Relevancy")), verdicts, "Output Relevancy");
   renderScoringMetricColumn(refs.completenessBlock, groupsByMetric.get(normalizeComparisonText("Completeness")), verdicts, "Completeness");
+  renderScoringMetricColumn(refs.correctnessBlock, groupsByMetric.get(normalizeComparisonText("Correctness")), verdicts, "Correctness");
 }
 
 function renderScoringMetricColumn(container, group, verdicts, label) {
@@ -472,7 +490,7 @@ function renderScoringMetricColumn(container, group, verdicts, label) {
   container.appendChild(stack);
 }
 
-function buildRubricGroups(rubrics) {
+function buildRubricGroups(rubrics, verdicts = []) {
   const groups = new Map();
 
   rubrics.forEach((rubric) => {
@@ -506,6 +524,42 @@ function buildRubricGroups(rubrics) {
         weight: firstText(item.importance, rubric.metric_importance, "Unspecified")
       });
     });
+  });
+
+  verdicts.forEach((verdict) => {
+    const metricName = cleanupItemLabel(firstText(verdict.metric_name, verdict.criterion_name, "Other"));
+    if (!metricName) {
+      return;
+    }
+
+    if (!groups.has(metricName)) {
+      groups.set(metricName, {
+        name: metricName,
+        description: "",
+        importance: "Unspecified",
+        maxScore: null,
+        items: []
+      });
+    }
+
+    const group = groups.get(metricName);
+    const evaluationItems = ensureArray(verdict.evaluation_items);
+
+    if (group.maxScore === null && evaluationItems.length) {
+      group.maxScore = 2;
+    }
+
+    if (!group.items.length) {
+      evaluationItems.forEach((item) => {
+        const itemName = firstText(item.item_name, item.item, "Unnamed item");
+        group.items.push({
+          rawName: itemName,
+          criterion: cleanupItemLabel(itemName),
+          description: firstText(item.reasoning, ""),
+          weight: firstText(item.importance, "Unspecified")
+        });
+      });
+    }
   });
 
   const orderedGroups = Array.from(groups.values()).sort((left, right) => {
@@ -605,7 +659,7 @@ function renderOverallSummary(example) {
   const evalRow = pickEvaluationRow(example);
   const rubrics = getRubrics(evalRow);
   const verdicts = getVerdicts(evalRow);
-  const groups = rubrics.length ? buildRubricGroups(rubrics) : [];
+  const groups = buildRubricGroups(rubrics, verdicts);
 
   refs.scoreStrip.textContent = "";
   groups.forEach((group) => {
@@ -762,6 +816,9 @@ function inferMetricDescription(metricName, items) {
   if (lowerName.includes("complete")) {
     return "Assesses whether the output covers the needed structural elements and organizes them into a coherent whole.";
   }
+  if (lowerName.includes("correct")) {
+    return "Assesses whether the suggested edits are accurate, faithful to the source, and safe to apply without introducing errors.";
+  }
 
   const descriptions = uniqueValues(items.map((item) => item.description)).slice(0, 2);
   return descriptions.join(" ") || "Metric description is not available in the uploaded payload.";
@@ -832,6 +889,7 @@ function hasEvaluationData(row) {
       row?.eval_overall_notes ||
       row?.eval_output_relevancy_score !== undefined ||
       row?.eval_completeness_score !== undefined ||
+      row?.eval_correctness_score !== undefined ||
       row?.eval_score !== undefined
   );
 }
@@ -839,7 +897,8 @@ function hasEvaluationData(row) {
 function getDirectMetricScores(row) {
   return [
     { label: "Output Relevancy", score: firstText(row?.eval_output_relevancy_score, "") },
-    { label: "Completeness", score: firstText(row?.eval_completeness_score, "") }
+    { label: "Completeness", score: firstText(row?.eval_completeness_score, "") },
+    { label: "Correctness", score: firstText(row?.eval_correctness_score, "") }
   ].filter((entry) => entry.score !== "");
 }
 
