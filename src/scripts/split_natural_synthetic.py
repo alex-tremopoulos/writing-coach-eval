@@ -36,6 +36,7 @@ SYNTHETIC_EXACT_SOURCES = {"extra_respond_alex"}
 EVAL_STATUS_COLUMN = "eval_status"
 OUTPUT_RELEVANCY_COLUMN = "eval_output_relevancy_score"
 COMPLETENESS_COLUMN = "eval_completeness_score"
+CORRECTNESS_COLUMN = "eval_correctness_score"
 DATASET_SOURCE_COLUMN = "dataset_source"
 
 
@@ -83,27 +84,40 @@ def _avg_std(scores: list[float]) -> tuple[float, float]:
 
 def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute per-route, micro, and macro score statistics from OK-status results."""
-    route_buckets: dict[str, dict[str, list[float]]] = {}
+    route_buckets: dict[str, dict[str, Any]] = {}
     for result in ok_results:
         bucket = route_buckets.setdefault(
             result["route"],
-            {"output_relevancy_score": [], "completeness_score": []},
+            {
+                "row_count": 0,
+                "output_relevancy_score": [],
+                "completeness_score": [],
+                "correctness_score": [],
+            },
         )
-        for field in ("output_relevancy_score", "completeness_score"):
+        bucket["row_count"] += 1
+        for field in ("output_relevancy_score", "completeness_score", "correctness_score"):
             if result.get(field) is not None:
                 bucket[field].append(result[field])
 
     per_route = {
         route: {
-            "n": len(bucket["output_relevancy_score"]),
+            "n": bucket["row_count"],
+            "counts": {
+                "output_relevancy_score": len(bucket["output_relevancy_score"]),
+                "completeness_score": len(bucket["completeness_score"]),
+                "correctness_score": len(bucket["correctness_score"]),
+            },
             "output_relevancy": _avg_std(bucket["output_relevancy_score"]),
             "completeness": _avg_std(bucket["completeness_score"]),
+            "correctness": _avg_std(bucket["correctness_score"]),
         }
         for route, bucket in route_buckets.items()
     }
 
     all_relevancy = [score for bucket in route_buckets.values() for score in bucket["output_relevancy_score"]]
     all_completeness = [score for bucket in route_buckets.values() for score in bucket["completeness_score"]]
+    all_correctness = [score for bucket in route_buckets.values() for score in bucket["correctness_score"]]
     route_relevancy_avgs = [
         _avg_std(bucket["output_relevancy_score"])[0]
         for bucket in route_buckets.values()
@@ -114,18 +128,35 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
         for bucket in route_buckets.values()
         if bucket["completeness_score"]
     ]
+    route_correctness_avgs = [
+        _avg_std(bucket["correctness_score"])[0]
+        for bucket in route_buckets.values()
+        if bucket["correctness_score"]
+    ]
 
     return {
         "per_route": per_route,
         "micro": {
-            "n": len(all_relevancy),
+            "n": len(ok_results),
+            "counts": {
+                "output_relevancy_score": len(all_relevancy),
+                "completeness_score": len(all_completeness),
+                "correctness_score": len(all_correctness),
+            },
             "output_relevancy": _avg_std(all_relevancy),
             "completeness": _avg_std(all_completeness),
+            "correctness": _avg_std(all_correctness),
         },
         "macro": {
-            "n_routes": len(route_relevancy_avgs),
+            "n_routes": len(route_buckets),
+            "counts": {
+                "output_relevancy_score": len(route_relevancy_avgs),
+                "completeness_score": len(route_completeness_avgs),
+                "correctness_score": len(route_correctness_avgs),
+            },
             "output_relevancy": _avg_std(route_relevancy_avgs),
             "completeness": _avg_std(route_completeness_avgs),
+            "correctness": _avg_std(route_correctness_avgs),
         },
     }
 
@@ -153,7 +184,7 @@ def resolve_route_column(df: pd.DataFrame, requested: str, input_path: Path) -> 
 
     In auto mode, prefer inferring from the input path:
     - paths containing 'intended' -> route_intended
-    - paths containing 'orchestrator' -> route_orchestrator / route_orch
+    - paths containing 'orchestrator' or 'route_orch' -> route_orchestrator / route_orch
     - otherwise fall back to a generic route column, then legacy columns
     """
     if requested != "auto":
@@ -168,7 +199,7 @@ def resolve_route_column(df: pd.DataFrame, requested: str, input_path: Path) -> 
         if inferred_column is not None:
             return inferred_column
 
-    if "orchestrator" in path_text:
+    if "orchestrator" in path_text or "route_orch" in path_text:
         inferred_column = _first_existing_column(df, ["route_orchestrator", "route_orch"])
         if inferred_column is not None:
             return inferred_column
@@ -206,6 +237,8 @@ def normalize_eval_frame(df: pd.DataFrame, route_column: str) -> pd.DataFrame:
     normalized[EVAL_STATUS_COLUMN] = normalized[EVAL_STATUS_COLUMN].fillna("MISSING").astype(str)
     normalized[OUTPUT_RELEVANCY_COLUMN] = pd.to_numeric(normalized[OUTPUT_RELEVANCY_COLUMN], errors="coerce")
     normalized[COMPLETENESS_COLUMN] = pd.to_numeric(normalized[COMPLETENESS_COLUMN], errors="coerce")
+    if CORRECTNESS_COLUMN in normalized.columns:
+        normalized[CORRECTNESS_COLUMN] = pd.to_numeric(normalized[CORRECTNESS_COLUMN], errors="coerce")
     return normalized
 
 
@@ -213,13 +246,19 @@ def extract_ok_results(df: pd.DataFrame, route_column: str) -> list[dict[str, An
     """Convert OK rows with valid scores into the structure expected by the aggregator."""
     ok_mask = df[EVAL_STATUS_COLUMN].str.upper() == "OK"
     valid_score_mask = df[OUTPUT_RELEVANCY_COLUMN].notna() & df[COMPLETENESS_COLUMN].notna()
-    filtered = df.loc[ok_mask & valid_score_mask, [route_column, OUTPUT_RELEVANCY_COLUMN, COMPLETENESS_COLUMN]]
+    selected_columns = [route_column, OUTPUT_RELEVANCY_COLUMN, COMPLETENESS_COLUMN]
+    if CORRECTNESS_COLUMN in df.columns:
+        selected_columns.append(CORRECTNESS_COLUMN)
+    filtered = df.loc[ok_mask & valid_score_mask, selected_columns]
 
     return [
         {
             "route": row[route_column],
             "output_relevancy_score": float(row[OUTPUT_RELEVANCY_COLUMN]),
             "completeness_score": float(row[COMPLETENESS_COLUMN]),
+            "correctness_score": (
+                float(row[CORRECTNESS_COLUMN]) if CORRECTNESS_COLUMN in filtered.columns and pd.notna(row[CORRECTNESS_COLUMN]) else None
+            ),
         }
         for _, row in filtered.iterrows()
     ]
@@ -247,6 +286,7 @@ def _stats_to_jsonable(stats: dict[str, Any]) -> dict[str, Any]:
     for route, route_stats in stats["per_route"].items():
         per_route[route] = {
             "n": route_stats["n"],
+            "counts": route_stats["counts"],
             "output_relevancy": {
                 "avg": route_stats["output_relevancy"][0],
                 "std": route_stats["output_relevancy"][1],
@@ -255,12 +295,17 @@ def _stats_to_jsonable(stats: dict[str, Any]) -> dict[str, Any]:
                 "avg": route_stats["completeness"][0],
                 "std": route_stats["completeness"][1],
             },
+            "correctness": {
+                "avg": route_stats["correctness"][0],
+                "std": route_stats["correctness"][1],
+            },
         }
 
     return {
         "per_route": per_route,
         "micro": {
             "n": stats["micro"]["n"],
+            "counts": stats["micro"]["counts"],
             "output_relevancy": {
                 "avg": stats["micro"]["output_relevancy"][0],
                 "std": stats["micro"]["output_relevancy"][1],
@@ -269,9 +314,14 @@ def _stats_to_jsonable(stats: dict[str, Any]) -> dict[str, Any]:
                 "avg": stats["micro"]["completeness"][0],
                 "std": stats["micro"]["completeness"][1],
             },
+            "correctness": {
+                "avg": stats["micro"]["correctness"][0],
+                "std": stats["micro"]["correctness"][1],
+            },
         },
         "macro": {
             "n_routes": stats["macro"]["n_routes"],
+            "counts": stats["macro"]["counts"],
             "output_relevancy": {
                 "avg": stats["macro"]["output_relevancy"][0],
                 "std": stats["macro"]["output_relevancy"][1],
@@ -279,6 +329,10 @@ def _stats_to_jsonable(stats: dict[str, Any]) -> dict[str, Any]:
             "completeness": {
                 "avg": stats["macro"]["completeness"][0],
                 "std": stats["macro"]["completeness"][1],
+            },
+            "correctness": {
+                "avg": stats["macro"]["correctness"][0],
+                "std": stats["macro"]["correctness"][1],
             },
         },
     }
@@ -312,24 +366,45 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
         route_stats = stats["per_route"][route]
         relevancy_avg, relevancy_std = route_stats["output_relevancy"]
         completeness_avg, completeness_std = route_stats["completeness"]
+        correctness_avg, correctness_std = route_stats["correctness"]
+        correctness_text = (
+            f"  Correctness={correctness_avg:.3f} (+/-{correctness_std:.3f})"
+            if route_stats["counts"]["correctness_score"] > 0
+            else "  Correctness=N/A"
+        )
         print(
             f"  {route:20} Output Relevancy={relevancy_avg:.3f} (+/-{relevancy_std:.3f})  "
-            f"Completeness={completeness_avg:.3f} (+/-{completeness_std:.3f})  n={route_stats['n']}"
+            f"Completeness={completeness_avg:.3f} (+/-{completeness_std:.3f})"
+            f"{correctness_text}  n={route_stats['n']}"
         )
 
     micro = stats["micro"]
     macro = stats["macro"]
     micro_rel_avg, micro_rel_std = micro["output_relevancy"]
     micro_comp_avg, micro_comp_std = micro["completeness"]
+    micro_corr_avg, micro_corr_std = micro["correctness"]
     macro_rel_avg, macro_rel_std = macro["output_relevancy"]
     macro_comp_avg, macro_comp_std = macro["completeness"]
+    macro_corr_avg, macro_corr_std = macro["correctness"]
+    micro_correctness_text = (
+        f"  Correctness={micro_corr_avg:.3f} (+/-{micro_corr_std:.3f})"
+        if micro["counts"]["correctness_score"] > 0
+        else "  Correctness=N/A"
+    )
+    macro_correctness_text = (
+        f"  Correctness={macro_corr_avg:.3f} (+/-{macro_corr_std:.3f})"
+        if macro["counts"]["correctness_score"] > 0
+        else "  Correctness=N/A"
+    )
     print(
         f"  {'OVERALL (micro)':20} Output Relevancy={micro_rel_avg:.3f} (+/-{micro_rel_std:.3f})  "
-        f"Completeness={micro_comp_avg:.3f} (+/-{micro_comp_std:.3f})  n={micro['n']}"
+        f"Completeness={micro_comp_avg:.3f} (+/-{micro_comp_std:.3f})"
+        f"{micro_correctness_text}  n={micro['n']}"
     )
     print(
         f"  {'OVERALL (macro)':20} Output Relevancy={macro_rel_avg:.3f} (+/-{macro_rel_std:.3f})  "
-        f"Completeness={macro_comp_avg:.3f} (+/-{macro_comp_std:.3f})  n_routes={macro['n_routes']}"
+        f"Completeness={macro_comp_avg:.3f} (+/-{macro_comp_std:.3f})"
+        f"{macro_correctness_text}  n_routes={macro['n_routes']}"
     )
 
 
@@ -398,7 +473,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Route column used for aggregation. Default: auto, which infers the column "
             "from the input path: folders/files containing 'intended' use route_intended; "
-            "folders/files containing 'orchestrator' use route_orchestrator or route_orch."
+            "folders/files containing 'orchestrator' or 'route_orch' use "
+            "route_orchestrator or route_orch."
         ),
     )
     parser.add_argument(
