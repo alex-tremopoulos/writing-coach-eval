@@ -621,7 +621,7 @@ async def process_row(
         max_tokens: Max tokens per LLM call.
         semaphore: Concurrency limiter.
         generator_only: If True, stop after Stage 1 and skip the judge.
-        rubrics_mode: ``'combined'`` uses a single LLM call with rubrics_prompt2.txt
+        rubrics_mode: ``'combined'`` uses a single LLM call with rubrics_prompt.txt
             (both metrics together). ``'split'`` makes two separate LLM calls — one
             per metric — using the metric-specific prompt files, then merges the
             resulting rubrics before judging.
@@ -1446,7 +1446,7 @@ def main():
         default="combined",
         help=(
             "How to run the rubrics generator. "
-            "'combined' (default): single LLM call with both metrics in one prompt (rubrics_prompt2.txt). "
+            "'combined' (default): single LLM call with both metrics in one prompt (rubrics_prompt.txt). "
             "'split': two parallel LLM calls, one per metric, using the metric-specific prompt files."
         ),
     )
