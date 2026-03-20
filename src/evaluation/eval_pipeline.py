@@ -96,6 +96,171 @@ SCORE_FIELD_LABELS = {
     "correctness_score": CORRECTNESS_METRIC_NAME,
 }
 
+REMOVAL_REQUEST_RE = re.compile(
+    r"\b(remove|delete|delet(e|ion)|omit|drop|cut|trim|erase|exclude|eliminate|strip out|take out)\b"
+    r"|\b(blank lines?|empty lines?|line breaks?|newlines?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_removal_request(query: str) -> bool:
+    """Return True when the user command is primarily asking to remove content."""
+    return bool(REMOVAL_REQUEST_RE.search(query or ""))
+
+
+def _suggestion_has_payload(suggestion: dict[str, Any]) -> bool:
+    """Return True when a suggestion contains enough data to be judged.
+
+    Empty ``transformed_text`` is still meaningful for deletions, so suggestions
+    are retained whenever they include any textual field, explanation, or span.
+    """
+    if not isinstance(suggestion, dict):
+        return False
+    if suggestion.get("original_text") is not None:
+        return True
+    if suggestion.get("transformed_text") is not None:
+        return True
+    if str(suggestion.get("explanation") or "").strip():
+        return True
+    return isinstance(suggestion.get("char_start"), int) and isinstance(suggestion.get("char_end"), int)
+
+
+def _suggestion_has_nonempty_transformed_text(suggestion: dict[str, Any]) -> bool:
+    """Return True when ``transformed_text`` is present and not the empty string."""
+    transformed = suggestion.get("transformed_text")
+    return isinstance(transformed, str) and transformed != ""
+
+
+def _normalize_whitespace(text: str) -> str:
+    """Collapse all whitespace runs into single spaces and strip."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_whitespace_only_edit(original: str, transformed: str) -> bool:
+    """Return True when the only difference between original and transformed is whitespace."""
+    return (
+        bool(original) and bool(transformed)
+        and _normalize_whitespace(original) == _normalize_whitespace(transformed)
+    )
+
+
+def _is_removal_within_context(original: str, transformed: str) -> bool:
+    """Return True when transformed is original with some content removed.
+
+    Checks that every word in the transformed text appears in the original in
+    the same order (i.e., transformed is a word-level subsequence of original)
+    and that it is meaningfully shorter.
+    """
+    if not original or not transformed:
+        return False
+    if len(transformed) >= len(original):
+        return False
+    orig_words = original.split()
+    trans_words = transformed.split()
+    if len(trans_words) >= len(orig_words):
+        return False
+    oi = 0
+    for tw in trans_words:
+        while oi < len(orig_words) and orig_words[oi] != tw:
+            oi += 1
+        if oi >= len(orig_words):
+            return False
+        oi += 1
+    return True
+
+
+def _is_sentence_removed_from_context(original: str, transformed: str) -> bool:
+    """Return True when original is a sentence/phrase removed from a longer context.
+
+    Pattern: original (shorter) does not appear in transformed (longer), meaning
+    the original text was excised from the surrounding paragraph that is shown
+    as the proposed revision.
+    """
+    if not original or not transformed:
+        return False
+    if len(original) >= len(transformed):
+        return False
+    # The removed sentence should not appear in the result
+    original_norm = _normalize_whitespace(original)
+    transformed_norm = _normalize_whitespace(transformed)
+    return original_norm not in transformed_norm
+
+
+def _compute_removed_text(original: str, transformed: str) -> str:
+    """Return the text segments present in original but absent in transformed."""
+    import difflib
+    orig_words = original.split()
+    trans_words = transformed.split()
+    sm = difflib.SequenceMatcher(None, orig_words, trans_words)
+    removed_parts: list[str] = []
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag in ("delete", "replace"):
+            removed_parts.append(" ".join(orig_words[i1:i2]))
+    return " [...] ".join(removed_parts) if removed_parts else ""
+
+
+def _classify_suggestion_operation(suggestion: dict[str, Any], is_removal_request: bool = False) -> str:
+    """Classify the suggestion as insertion, deletion, removal, whitespace_edit, replacement, or generic edit."""
+    original = suggestion.get("original_text")
+    transformed = suggestion.get("transformed_text")
+
+    has_original = isinstance(original, str) and original != ""
+    has_transformed = isinstance(transformed, str) and transformed != ""
+
+    if has_original and not has_transformed:
+        return "deletion"
+    if not has_original and has_transformed:
+        return "insertion"
+    if has_original and has_transformed:
+        if _is_whitespace_only_edit(original, transformed):
+            return "whitespace_edit"
+        if _is_removal_within_context(original, transformed):
+            return "removal"
+        # Pattern B: original is the sentence removed; transformed is the
+        # surrounding paragraph without it (transformed > original).
+        if is_removal_request and _is_sentence_removed_from_context(original, transformed):
+            return "removal"
+        return "replacement"
+    if isinstance(suggestion.get("char_start"), int) and isinstance(suggestion.get("char_end"), int):
+        if suggestion["char_end"] > suggestion["char_start"] and not has_transformed:
+            return "deletion"
+    return "edit"
+
+
+def _format_text_for_judge(text: Any, empty_label: str) -> str:
+    """Render text so empty and whitespace-only edits remain visible to the judge."""
+    if text is None:
+        return empty_label
+    if not isinstance(text, str):
+        text = str(text)
+    if text == "":
+        return empty_label
+    if text.strip() == "":
+        return f"(whitespace-only text; literal={json.dumps(text)})"
+    return text
+
+
+def _is_revise_route(route: str) -> bool:
+    """Return True for REVISE_SIMPLE and REVISE_RESEARCH routes."""
+    return route.upper().startswith("REVISE")
+
+
+def _should_force_zero_correctness(row: dict[str, Any]) -> bool:
+    """Flag clearly invalid empty revisions for deterministic Correctness=0.
+
+    Returns True when:
+    - All retained suggestions have empty transformed_text AND is not a removal request.
+    - The route is REVISE_* but there are zero suggestions AND is not a removal request.
+    """
+    is_removal = bool(row.get("is_removal_request"))
+    if is_removal:
+        return False
+    if bool(row.get("has_suggestions")) and not bool(row.get("has_nonempty_transformed_text")):
+        return True
+    if _is_revise_route(row.get("route", "")) and not bool(row.get("has_suggestions")):
+        return True
+    return False
+
 # ---------------------------------------------------------------------------
 # LangChain Azure OpenAI model (cached per parameter set)
 # ---------------------------------------------------------------------------
@@ -334,10 +499,10 @@ def _extract_metric_scores(evaluation: list[dict[str, Any]]) -> dict[str, int | 
     return scores
 
 
-def _required_score_fields(has_suggestions: bool) -> list[str]:
+def _required_score_fields(has_suggestions: bool, is_revise_route: bool = False) -> list[str]:
     """Return the metric score fields expected for a given row."""
     required = ["output_relevancy_score", "completeness_score"]
-    if has_suggestions:
+    if has_suggestions or is_revise_route:
         required.append("correctness_score")
     return required
 
@@ -445,7 +610,9 @@ def load_input_data(
       the full output to evaluate; for REVISE routes this is a short explanatory note
       that accompanies the suggestions.
     - ``suggestions``: list of revision suggestion dicts (original_text, transformed_text, explanation)
-    - ``has_suggestions``: True when at least one suggestion has a non-empty transformed_text
+    - ``has_suggestions``: True when at least one suggestion payload exists, including deletions
+    - ``has_nonempty_transformed_text``: True when at least one suggestion proposes replacement text
+    - ``is_removal_request``: True when the user query is asking to delete/remove content
 
     Args:
         input_path: Path to all_results.csv (must have an ``output`` JSON column).
@@ -517,12 +684,15 @@ def load_input_data(
 
         response_text = str(output_data.get("response", "")).strip() if output_data else ""
 
-        # Keep only suggestions with a non-empty transformed_text
+        # Keep all meaningful suggestions, including deletions whose transformed_text is empty.
         raw_suggestions = output_data.get("suggestions", []) if output_data else []
         suggestions = [
             s for s in (raw_suggestions or [])
-            if isinstance(s, dict) and (s.get("transformed_text") or "").strip()
+            if _suggestion_has_payload(s)
         ]
+        has_nonempty_transformed_text = any(
+            _suggestion_has_nonempty_transformed_text(s) for s in suggestions
+        )
 
         rows.append({
             "row_id": int(row["row_id"]),
@@ -532,6 +702,8 @@ def load_input_data(
             "response_text": response_text,
             "suggestions": suggestions,
             "has_suggestions": len(suggestions) > 0,
+            "has_nonempty_transformed_text": has_nonempty_transformed_text,
+            "is_removal_request": _is_removal_request(str(row.get("query", ""))),
         })
 
     logger.info("Loaded %d rows from %s", len(rows), input_path)
@@ -543,7 +715,11 @@ def load_input_data(
 # ---------------------------------------------------------------------------
 
 
-def _format_output_for_judge(response_text: str, suggestions: list[dict]) -> str:
+def _format_output_for_judge(
+    response_text: str,
+    suggestions: list[dict],
+    is_removal_request: bool = False,
+) -> str:
     """Format the writing coach output for the judge LLM.
 
     For routes with no suggestions (RESPOND, RESEARCH), returns response_text directly —
@@ -556,7 +732,7 @@ def _format_output_for_judge(response_text: str, suggestions: list[dict]) -> str
         response_text: The output["response"] field. This is the full response for
             RESPOND/RESEARCH routes, or a short explanatory note for REVISE routes.
         suggestions: List of suggestion dicts with keys: original_text, transformed_text,
-            explanation.  Only suggestions with a non-empty transformed_text are expected here.
+            explanation. Empty transformed_text remains meaningful for deletions.
 
     Returns:
         A formatted string suitable for the judge_prompt ``{output_text}`` slot.
@@ -572,26 +748,70 @@ def _format_output_for_judge(response_text: str, suggestions: list[dict]) -> str
     parts.append(
         f"### Revision Suggestions ({len(suggestions)} total)\n"
         "Each suggestion shows the original passage and the proposed revision. "
-        "The user can accept or reject each suggestion independently."
+        "The user can accept or reject each suggestion independently. "
+        "An empty proposed revision means delete the original text/span entirely. "
+        "Whitespace-only text is shown with an escaped literal so blank-line edits remain visible."
     )
 
     for i, s in enumerate(suggestions, 1):
-        original = (s.get("original_text") or "").strip()
-        transformed = (s.get("transformed_text") or "").strip()
+        original = s.get("original_text")
+        transformed = s.get("transformed_text")
         explanation = (s.get("explanation") or "").strip()
         char_start = s.get("char_start")
         char_end = s.get("char_end")
+        operation = _classify_suggestion_operation(s, is_removal_request=is_removal_request)
 
         block_lines = [f"#### Suggestion {i}"]
+        block_lines.append(f"**Operation Type**: {operation}")
+
+        # Add explicit annotations for operations the judge typically misreads
+        if operation == "removal":
+            orig_str = str(original or "")
+            trans_str = str(transformed or "")
+            if len(orig_str) > len(trans_str):
+                # Pattern A: original is the paragraph, transformed is paragraph minus sentence
+                removed = _compute_removed_text(orig_str, trans_str)
+                if removed:
+                    block_lines.append(
+                        f"**Removed Content**: The following text was removed from the "
+                        f"original passage while keeping the surrounding context intact:\n{removed}"
+                    )
+            else:
+                # Pattern B: original is the sentence removed; transformed is surrounding context without it
+                block_lines.append(
+                    f"**Removed Content**: The original text shown below was removed from "
+                    f"the paragraph. The proposed revision shows the surrounding paragraph "
+                    f"after this sentence/phrase was excised. The remaining text in the "
+                    f"proposed revision is NOT new content — it already exists in the document."
+                )
+        elif operation == "whitespace_edit":
+            block_lines.append(
+                "**Whitespace-Only Edit**: The text content is identical; only "
+                "whitespace has changed (e.g., empty lines removed, line breaks "
+                "consolidated). This is a formatting edit, not a content change."
+            )
+
         if explanation:
             block_lines.append(f"**Purpose**: {explanation}")
         if isinstance(char_start, int) and isinstance(char_end, int):
             block_lines.append(f"**Span**: char_start={char_start}, char_end={char_end}")
-        if original:
-            block_lines.append(f"**Original Text**:\n{original}")
+        if original is None:
+            block_lines.append("**Original Text**: (not provided)")
         else:
-            block_lines.append("**Original Text**: (insertion — no existing text is replaced)")
-        block_lines.append(f"**Proposed Revision**:\n{transformed}")
+            block_lines.append(
+                "**Original Text**:\n"
+                + _format_text_for_judge(
+                    original,
+                    "(empty string — insertion or empty selected span)",
+                )
+            )
+        block_lines.append(
+            "**Proposed Revision**:\n"
+            + _format_text_for_judge(
+                transformed,
+                "(empty string — delete the original text)",
+            )
+        )
 
         parts.append("\n".join(block_lines))
 
@@ -762,6 +982,7 @@ async def process_row(
             output_for_judge = _format_output_for_judge(
                 response_text=row["response_text"],
                 suggestions=row.get("suggestions", []),
+                is_removal_request=row.get("is_removal_request", False),
             )
 
             judge_system, judge_user = build_judge_prompts(
@@ -769,7 +990,10 @@ async def process_row(
                 input_text=row["input"],
                 output_text=output_for_judge,
                 rubrics=rubrics_str,
-                include_correctness=bool(row.get("has_suggestions")),
+                include_correctness=(
+                    bool(row.get("has_suggestions"))
+                    or _is_revise_route(row.get("route", ""))
+                ),
             )
 
             judge_response = await call_llm(
@@ -797,7 +1021,13 @@ async def process_row(
             metric_scores = _extract_metric_scores(evaluation)
             result.update(metric_scores)
 
-            required_score_fields = _required_score_fields(bool(row.get("has_suggestions")))
+            if _should_force_zero_correctness(row):
+                result["correctness_score"] = 0
+
+            required_score_fields = _required_score_fields(
+                bool(row.get("has_suggestions")),
+                is_revise_route=_is_revise_route(row.get("route", "")),
+            )
             if any(result.get(field) is None for field in required_score_fields):
                 logger.warning("Row %d: Judge response missing one or more metric scores", row_id)
                 result["status"] = "JUDGE_INCOMPLETE"
