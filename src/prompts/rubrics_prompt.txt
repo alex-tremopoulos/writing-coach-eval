@@ -120,6 +120,8 @@ The original manuscript or text content provided by the user.
 - Treat `input_text` as the original source text supplied by the user
 - Do not interpret `input_text` as already revised, already improved, or as the model's output
 - For REVISE routes, define rubric items for suggested edits or modifications that should be made to the original input text
+- For REVISE routes, remember that a deletion or removal request may be represented as replacing a longer original span with a shorter revised span that omits the targeted content. This is still a removal edit, not an addition.
+- For REVISE routes, an empty `transformed_text` with non-empty original text means full deletion of the original span. This includes deletion of blank lines or empty lines.
 - For RESPOND and RESEARCH routes, use the input text as context, not as text to be treated as already modified
 - Any suggested edits, issues, or opportunities referenced in the rubrics must be traceable to the input text or the user command
 
@@ -203,6 +205,7 @@ Return only the completed rubrics. Do not add prefatory text, analysis, or comme
 - Never create more than one top-level rubric for the same metric
 - Never treat `input_text` as if it were already revised output
 - Never evaluate hypothetical edits that are not grounded in the input text, user command, or route prompt
+- Never misclassify a shorter revised replacement as an addition when the user requested deletion, removal, trimming, or omission of existing content
 - Never include expectations that exceed the selected route's capabilities
 - Never output chain-of-thought, planning notes, or extra explanation outside the requested rubrics
 - **Citation Evaluation Exclusion**: Do not create evaluation items that require accessing or verifying the content of the actual cited papers. The evaluation pipeline cannot retrieve or read referenced papers, so any rubric item that checks whether a citation accurately supports a specific claim or whether a cited paper is appropriate for the context must be excluded. Citation-presence items (e.g., "does the output include at least one citation?") are permissible only if they do not require inspecting paper content.
@@ -214,6 +217,7 @@ Use this workflow:
 1. **Extract intents from the user command**: include explicit requests and key implicit requirements such as preservation of meaning, tone, or terminology.
 2. **Use metrics as the primary filter**: create exactly one top-level rubric per metric and exclude any dimension not covered by the provided metrics.
 3. **Ground the rubrics in the input text**: evaluation items and indicators must be traceable to real issues, claims, constraints, or opportunities in the input text.
+   - If the command names a sentence or phrase to delete, first verify whether that exact wording is present in the input text. If not, build the rubric around the closest feasible target that matches the user's evident intent.
 4. **Respect route scope**: only include expectations the selected route can satisfy.
 5. **Map intents into evaluation items under each metric**: group related sub-aspects under the relevant metric-level rubric instead of creating extra top-level rubrics.
 6. **Use the fixed scoring scheme**:
@@ -224,6 +228,7 @@ Use this workflow:
 **Compact mapping logic**:
 - If the user asks to fix grammar, **Output Relevancy** should focus on whether the edits target the requested grammar issues, while **Completeness** should focus on whether all major requested issues are covered.
 - If the user asks to add citations, **Output Relevancy** should focus on whether the sources support the targeted claims, while **Completeness** should focus on whether all major unsupported claims within scope are covered.
+- If the user asks to remove, delete, trim, omit, or cut part of the text, **Output Relevancy** should focus on whether the targeted material is actually removed, and **Completeness** should focus on whether all requested removals are covered without leaving the requested deletion incomplete. Note that a removal may appear as the original paragraph minus the deleted sentence(s) — this is still a removal, not an addition of new content. If the exact sentence quoted by the user does not exist verbatim in the input text, evaluate the closest matching sentence and do not penalize an impossible exact match.
 - If a quality dimension is not in the provided metrics, exclude it even if it seems useful.
 
 Checklist before finalizing:

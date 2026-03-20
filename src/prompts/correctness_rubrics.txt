@@ -15,16 +15,30 @@ Each item below is an evaluation item under the Correctness metric. Score every 
 - `1 = Partially Resolved`
 - `2 = Resolved`
 
+Applicability rule:
+- Not every Correctness item applies to every example. Determine whether each item is applicable from the `user_command`, `input_text`, and `output_text`.
+- If an item is genuinely not applicable, assign `2 = Resolved` and briefly note that no issue was expected or observed for that item.
+- **EXCEPTION — Zero suggestions on a required editing task**: "Not Applicable" applies to *individual items* when the edit type makes them irrelevant. It does **not** excuse an overall Correctness score of 2 when the output contains **no revision suggestions at all** for a task that clearly required producing revisions. If the user's command is an editing, addition, or modification request (not a deletion/removal), and the system produced zero suggestions, every Correctness item must be scored `0 = Unresolved` and the overall Correctness score must be `0 = Problematic`. An empty output on a required editing task is itself a correctness failure.
+- Do not penalize expected relocation, reordering, or repositioning behavior under rubrics that are meant to detect failed textual revision. For example, if the user's request is to move existing text to a different location, identical wording alone is not a Verbatim Copy failure.
+- Do not misclassify deletion or removal edits as additions. A removal can appear in three forms:
+  1. **Full deletion** — `transformed_text` is empty; the entire original span is deleted.
+  2. **Removal within context** — `transformed_text` reproduces the surrounding paragraph but omits the targeted sentence/clause. The operation type will say "removal" and a **Removed Content** annotation shows what was taken out. The remaining text is NOT new content.
+  3. **Whitespace / empty-line removal** — text content is identical but whitespace changed. The operation type will say "whitespace_edit".
+- Before treating an edit as incorrect because it did not remove the exact requested wording, first check whether the exact requested sentence or phrase actually exists in the input text. If it does not exist verbatim, judge the closest feasible intended target instead of penalizing an impossible exact match.
+- If a suggestion shows non-empty original text and empty `transformed_text`, that indicates full deletion of the original text/span. This can be correct for removal requests, including deleting blank lines or empty lines.
+
 Use these exact item names and importance labels.
 
 1. **Verbatim Copy Detection** (Importance: High)
    - What it checks: Whether a suggestion actually revises the text rather than copying the original text back with little or no meaningful change.
+   - Applicability note: Apply this when the request expects substantive wording changes. If the user's request is primarily to relocate, reorder, reposition, delete, or remove existing text, a suggestion can remain highly similar to the original while still making the requested substantive change.
    - Score 0: `transformed_text` is identical or nearly identical to `original_text`, with no substantive revision.
    - Score 1: The suggestion makes only superficial edits with limited practical effect.
-   - Score 2: The suggestion introduces a substantive revision rather than a trivial restatement.
+   - Score 2: The suggestion introduces a substantive revision rather than a trivial restatement, or the item is not applicable because preserving most wording is appropriate for the requested relocation, reordering, or deletion.
 
 2. **Redundant Suggestion (Element Already Exists)** (Importance: High)
    - What it checks: Whether the system suggests adding something that is already present in the input text.
+   - Applicability note: Apply this when the suggestion is functionally trying to add or re-add content. If the user's request is to delete or remove material, a shorter replacement that omits the targeted material should not be treated as an addition.
    - Score 0: The suggestion adds or re-adds an element already present without recognizing that it exists.
    - Score 1: The suggestion partially recognizes existing content but still duplicates or weakly repeats it.
    - Score 2: The suggestion does not redundantly add content that already exists, or it appropriately reframes the need as a revision.
@@ -48,19 +62,26 @@ Use these exact item names and importance labels.
    - Score 1: There are minor span collisions, adjacency issues, or small conflicts that a user could still sort out manually.
    - Score 2: The suggestions are cleanly independent and can be reviewed one by one without conflict.
 
-6. **Over-Specified Rewrite Instead of Minimal Edit** (Importance: Medium)
+6. **Requested Placement / Structural Location** (Importance: High)
+   - What it checks: Whether inserted, relocated, or restructured text is placed in the location or document section requested by the user.
+   - Examples of evidence: instructions such as adding content at the end, moving a paragraph before the conclusion, placing a list under a specific heading, or reordering material into a requested sequence.
+   - Score 0: The suggestion places the inserted or moved text in a clearly wrong location or section relative to the user's request.
+   - Score 1: The suggestion partially matches the requested placement, but the final position, section, or ordering is ambiguous or only loosely aligned.
+   - Score 2: The suggestion places the content in the requested location or structure, or the request does not specify placement precisely enough for a stricter requirement.
+
+7. **Over-Specified Rewrite Instead of Minimal Edit** (Importance: Medium)
    - What it checks: Whether the extent of editing matches the user's request, especially for local edits.
    - Score 0: The suggestion clearly goes beyond the requested level of intervention.
    - Score 1: The suggestion is somewhat over-edited relative to the request.
    - Score 2: The extent of editing matches the user's request.
 
-7. **Missing Actionability / Low-Value Suggestion** (Importance: Medium)
+8. **Missing Actionability / Low-Value Suggestion** (Importance: Medium)
    - What it checks: Whether each suggestion provides clear, distinct coaching value.
    - Score 0: The suggestion is low-value, redundant, or too weak to justify acceptance.
    - Score 1: The suggestion has some value but is only weakly actionable or distinct.
    - Score 2: The suggestion provides a distinct, useful improvement the user could reasonably accept.
 
-8. **Non-Paper-Like / Instructional Output** (Importance: High)
+9. **Non-Paper-Like / Instructional Output** (Importance: High)
    - What it checks: Whether the proposed revision reads like text that could be inserted into the paper rather than an instruction, placeholder, or editor note.
    - Score 0: The suggestion reads like an instruction to the model, an editor note, or a template placeholder rather than document-ready prose.
    - Score 1: The suggestion mixes usable paper text with instructional or meta-writing language.
