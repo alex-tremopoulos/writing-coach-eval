@@ -16,10 +16,12 @@ Each row contains:
 Manual overrides for route_intended
 ------------------------------------
   extra10           : row_id 3  → RESPOND,  row_id 5 → REVISE_RESEARCH
+  new21             : row_id 17 → REVISE_SIMPLE
   revise_research_only : row_ids 31,131,133,120,121 → REVISE_RESEARCH
-  respond_only      : row_ids 25,110,145 → RESPOND
+  respond_only      : row_ids 25,145 → RESPOND
                       all rows where route_orch == RESEARCH → RESPOND
-  new21, research_only, revise_simple_only: no overrides
+  revise_simple_only : row_id 184 → REVISE_SIMPLE
+  research_only: no overrides
 """
 
 import argparse
@@ -33,7 +35,7 @@ import pandas as pd
 # Paths
 # ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
-INPUT_BASE = ROOT / "data_outputs" / "whole_input"
+INPUT_BASE = ROOT / "data_outputs" / "round4"
 OUTPUT_DIR = ROOT / "final_data"
 REF_CSV = ROOT / "data" / "data_routes_expanded.csv"
 KIWI_REF_CSV = ROOT / "data" / "data_routes_kiwi_selected167.csv"
@@ -74,17 +76,24 @@ INTENDED_OVERRIDES: dict[str, dict[int, str]] = {
         3: "RESPOND",
         5: "REVISE_RESEARCH",
     },
+    "new21": {
+        17: "REVISE_SIMPLE",
+    },
     "revise_research_only": {
-        31: "REVISE_RESEARCH",
+        27: "REVISE_RESEARCH",
         131: "REVISE_RESEARCH",
-        133: "REVISE_RESEARCH",
+        119: "REVISE_RESEARCH",
         120: "REVISE_RESEARCH",
         121: "REVISE_RESEARCH",
+        150: "REVISE_RESEARCH",
+        169: "REVISE_RESEARCH",
     },
     "respond_only": {
         25: "RESPOND",
-        110: "RESPOND",
         145: "RESPOND",
+    },
+    "revise_simple_only": {
+        184: "REVISE_SIMPLE",
     },
 }
 
@@ -99,7 +108,7 @@ EXTRA_RESPOND_PREV_IDS = set(range(1, 10))   # prev_id 1–9
 
 def read_jsonl_files(folder: Path) -> pd.DataFrame:
     frames = []
-    for jsonl_file in sorted(f for f in folder.glob("*.jsonl") if not f.stem.endswith("_extra")):
+    for jsonl_file in sorted(f for f in folder.glob("*.jsonl")):
         records = []
         with open(jsonl_file, encoding="utf-8") as fh:
             for line in fh:
@@ -349,7 +358,6 @@ def main() -> None:
     # ---- 4c. For extra167kiwi: set route_intended from kiwi reference CSV ----
     # Rules:
     #   - Queries marked RESPOND in the ref CSV → route_intended = RESPOND
-    #   - row_id 76 (REVISE_SIMPLE in orchestrator) → route_intended = REVISE_RESEARCH
     #   - All other rows → route_intended = route_orch (already set above)
     kiwi_mask = combined["folder_source"] == "extra167kiwi"
     if kiwi_mask.any():
@@ -362,15 +370,10 @@ def main() -> None:
         respond_mask = kiwi_mask & combined["query"].str.strip().isin(respond_queries)
         combined.loc[respond_mask, "route_intended"] = "RESPOND"
 
-        # Manual override: row_id 76 → REVISE_RESEARCH
-        row76_mask = kiwi_mask & (combined["row_id_previous_folder"] == 76)
-        combined.loc[row76_mask, "route_intended"] = "REVISE_RESEARCH"
-
         print(f"\n  extra167kiwi route_intended:")
         print(f"    RESPOND overrides from ref CSV : {respond_mask.sum()}")
-        print(f"    REVISE_RESEARCH override (row 76): {int(row76_mask.sum())}")
         print(f"    Remaining use route_orch       : "
-              f"{kiwi_mask.sum() - respond_mask.sum() - int(row76_mask.sum())}")
+              f"{kiwi_mask.sum() - respond_mask.sum()}")
 
     # ---- 5. Build 'output' column ------------------------------------------
     combined["output"] = combined.apply(
