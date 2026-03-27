@@ -379,7 +379,6 @@ def build_giskard_model(model_type: SupportedModelTypes = "text_generation") -> 
 VALID_DETECTORS: list[str] = [
     "jailbreak",
     "stereotypes",
-    "ethical_bias",
     "harmfulness",
     # "llm_broken_text"
 ]
@@ -492,13 +491,18 @@ def run_scan(
 
         logger.info("Detector params: %s", detector_params)
 
-    scan_results: ScanReport = scan(
-        gsk_model,
-        gsk_dataset,
-        only=detectors,
-        raise_exceptions=False,
-        params=detector_params if detector_params else None,
-    )
+    if "llm_broken_text" in detectors:
+        LLMBrokenTextDetector = _detector_mod.LLMBrokenTextDetector
+        broken_text_detector = LLMBrokenTextDetector()
+        scan_results: ScanReport = broken_text_detector.run(model=gsk_model, dataset=gsk_dataset)
+    else:
+        scan_results: ScanReport = scan(
+            gsk_model,
+            gsk_dataset,
+            only=detectors,
+            raise_exceptions=False,
+            params=detector_params if detector_params else None,
+        )
 
     # 5. Persist results
     _persist_results(scan_results, output_dir, n_adversarial_samples=n_adversarial_samples, n_requirements=n_requirements)
@@ -540,6 +544,75 @@ def _persist_results(
         logger.warning("Could not generate test suite: %s", exc)
 
 
+def example_to_dict(example: dict) -> dict:
+    """Parse a conversation example record into structured fields.
+
+    The ``input`` column of a Giskard scan example contains a string of the form::
+
+        USER: {'document': '...', 'user_command': '...'}
+
+        AGENT: <free text>
+
+        SUGGESTIONS:
+        - {'original_text': '...', ...}
+
+    This function extracts the three sections and returns a dict with keys
+    ``user``, ``agent``, and ``suggestions``, where ``user`` is the parsed
+    input dict, ``agent`` is the plain text response string, and
+    ``suggestions`` is a list of parsed suggestion dicts.
+    """
+    import ast
+    import re
+
+    raw: str = example.get("input", "") if isinstance(example, dict) else str(example)
+
+    # Split on the three known section tags.
+    # We allow optional whitespace / newlines around the tags.
+    user_match = re.search(r"USER:\s*", raw)
+    agent_match = re.search(r"\n\nAGENT:\s*", raw)
+    suggestions_match = re.search(r"\n\n## SUGGESTIONS:\s*\n", raw)
+
+    # --- USER block ---
+    user_parsed = {}
+    if user_match:
+        start = user_match.end()
+        end = agent_match.start() if agent_match else (suggestions_match.start() if suggestions_match else len(raw))
+        user_str = raw[start:end].strip()
+        try:
+            user_parsed = ast.literal_eval(user_str)
+        except (ValueError, SyntaxError):
+            user_parsed = user_str
+
+    # --- AGENT block ---
+    agent_parsed = ""
+    if agent_match:
+        start = agent_match.end()
+        end = suggestions_match.start() if suggestions_match else len(raw)
+        agent_parsed = raw[start:end].strip()
+
+    # --- SUGGESTIONS block ---
+    suggestions_parsed = []
+    if suggestions_match:
+        start = suggestions_match.end()
+        suggestions_str = raw[start:].strip()
+        # Each suggestion is on a line starting with "- "
+        for line in re.split(r"\n-\s*", suggestions_str):
+            line = line.lstrip("- ").strip()
+            if not line:
+                continue
+            try:
+                suggestions_parsed.append(ast.literal_eval(line))
+            except (ValueError, SyntaxError):
+                suggestions_parsed.append(line)
+
+    return {
+        "input_text": user_parsed["document"],
+        "user_command": user_parsed["user_command"],
+        "agent": agent_parsed,
+        "suggestions": suggestions_parsed,
+    }
+
+
 def _save_json_summary(
         scan_results,
         out_path: Path,
@@ -549,6 +622,16 @@ def _save_json_summary(
     """Serialise the scan issue list to a JSON file."""
     issues = []
     for issue in scan_results.issues:
+        issue_examples = []
+        if issue.scan_examples is not None:
+            examples = issue.scan_examples.examples.to_dict(orient="records")
+            for example in examples:
+                reason = example.get("Reason", "")
+                system = example_to_dict(example["Conversation"])
+                issue_examples.append({
+                    "reason": reason,
+                    "system": system
+                })
         issues.append(
             {
                 "detector": getattr(issue, "detector_name", type(issue).__name__),
@@ -556,6 +639,7 @@ def _save_json_summary(
                 "level": getattr(issue, "level", ""),
                 "description": getattr(issue, "description", ""),
                 "meta": getattr(issue, "meta", {}),
+                "examples": issue_examples
             }
         )
 
