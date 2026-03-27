@@ -103,6 +103,7 @@ def load_rows(input_path: Path) -> list[dict[str, Any]]:
 		return rows
 
 	if suffix == ".csv":
+		csv.field_size_limit(10 * 1024 * 1024)  # 10 MB
 		with input_path.open("r", encoding="utf-8-sig", newline="") as handle:
 			return list(csv.DictReader(handle))
 
