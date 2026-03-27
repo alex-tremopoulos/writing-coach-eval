@@ -38,6 +38,7 @@ OUTPUT_RELEVANCY_COLUMN = "eval_output_relevancy_score"
 COMPLETENESS_COLUMN = "eval_completeness_score"
 CORRECTNESS_COLUMN = "eval_correctness_score"
 DATASET_SOURCE_COLUMN = "dataset_source"
+NON_RESPONSE_STATUS = "NO_RESPONSE"
 
 
 def find_default_input() -> Path | None:
@@ -80,6 +81,27 @@ def _avg_std(scores: list[float]) -> tuple[float, float]:
         return float("nan"), 0.0
     avg = sum(scores) / len(scores)
     return avg, (statistics.stdev(scores) if len(scores) >= 2 else 0.0)
+
+
+def _score_distribution(scores: list[float]) -> dict[int, dict[str, float | int]]:
+    """Return count and percentage for each discrete score value 0, 1, and 2."""
+    total = len(scores)
+    counts = Counter(int(score) for score in scores if score in (0, 1, 2))
+    return {
+        score: {
+            "count": counts.get(score, 0),
+            "pct": (counts.get(score, 0) / total * 100.0) if total else 0.0,
+        }
+        for score in (0, 1, 2)
+    }
+
+
+def _format_distribution(distribution: dict[int, dict[str, float | int]]) -> str:
+    """Render a score distribution as a compact 0/1/2 percentage summary."""
+    return "  ".join(
+        f"{score}={distribution[score]['pct']:.1f}% (n={distribution[score]['count']})"
+        for score in (0, 1, 2)
+    )
 
 
 def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -146,6 +168,11 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
             "output_relevancy": _avg_std(all_relevancy),
             "completeness": _avg_std(all_completeness),
             "correctness": _avg_std(all_correctness),
+            "distributions": {
+                "output_relevancy_score": _score_distribution(all_relevancy),
+                "completeness_score": _score_distribution(all_completeness),
+                "correctness_score": _score_distribution(all_correctness),
+            },
         },
         "macro": {
             "n_routes": len(route_buckets),
@@ -318,6 +345,7 @@ def _stats_to_jsonable(stats: dict[str, Any]) -> dict[str, Any]:
                 "avg": stats["micro"]["correctness"][0],
                 "std": stats["micro"]["correctness"][1],
             },
+            "distributions": stats["micro"]["distributions"],
         },
         "macro": {
             "n_routes": stats["macro"]["n_routes"],
@@ -343,7 +371,17 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
     print("\n" + "=" * 80)
     print(f"{summary['name'].upper()} DATA")
     print("=" * 80)
+    excluded_non_response = summary["status_counts"].get(NON_RESPONSE_STATUS, 0)
+    excluded_pct = (excluded_non_response / summary["rows"] * 100.0) if summary["rows"] else 0.0
+    included_rows = summary["rows"] - excluded_non_response
+
     print(f"Rows: {summary['rows']}")
+    print(f"Rows included in scoring: {included_rows}")
+    if excluded_non_response:
+        print(
+            f"No-response rows excluded: {excluded_non_response} "
+            f"({excluded_pct:.1f}%)"
+        )
     print(f"OK rows: {summary['ok_rows']}")
 
     if summary["status_counts"]:
@@ -368,7 +406,7 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
         completeness_avg, completeness_std = route_stats["completeness"]
         correctness_avg, correctness_std = route_stats["correctness"]
         correctness_text = (
-            f"  Correctness={correctness_avg:.3f} (+/-{correctness_std:.3f})"
+            f"  Correctness={correctness_avg:.3f} (+/-{correctness_std:.3f}) [n={route_stats['counts']['correctness_score']}]"
             if route_stats["counts"]["correctness_score"] > 0
             else "  Correctness=N/A"
         )
@@ -387,12 +425,12 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
     macro_comp_avg, macro_comp_std = macro["completeness"]
     macro_corr_avg, macro_corr_std = macro["correctness"]
     micro_correctness_text = (
-        f"  Correctness={micro_corr_avg:.3f} (+/-{micro_corr_std:.3f})"
+        f"  Correctness={micro_corr_avg:.3f} (+/-{micro_corr_std:.3f}) [n={micro['counts']['correctness_score']}]"
         if micro["counts"]["correctness_score"] > 0
         else "  Correctness=N/A"
     )
     macro_correctness_text = (
-        f"  Correctness={macro_corr_avg:.3f} (+/-{macro_corr_std:.3f})"
+        f"  Correctness={macro_corr_avg:.3f} (+/-{macro_corr_std:.3f}) [n={macro['counts']['correctness_score']}]"
         if macro["counts"]["correctness_score"] > 0
         else "  Correctness=N/A"
     )
@@ -401,6 +439,19 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
         f"Completeness={micro_comp_avg:.3f} (+/-{micro_comp_std:.3f})"
         f"{micro_correctness_text}  n={micro['n']}"
     )
+    print(
+        f"    Output Relevancy distribution: "
+        f"{_format_distribution(micro['distributions']['output_relevancy_score'])}"
+    )
+    print(
+        f"    Completeness distribution:     "
+        f"{_format_distribution(micro['distributions']['completeness_score'])}"
+    )
+    if micro["counts"]["correctness_score"] > 0:
+        print(
+            f"    Correctness distribution:      "
+            f"{_format_distribution(micro['distributions']['correctness_score'])}"
+        )
     print(
         f"  {'OVERALL (macro)':20} Output Relevancy={macro_rel_avg:.3f} (+/-{macro_rel_std:.3f})  "
         f"Completeness={macro_comp_avg:.3f} (+/-{macro_comp_std:.3f})"
@@ -495,7 +546,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Write the computed all/natural/synthetic summary metrics to a JSON file, "
-            "including status counts, route counts, and per-route/micro/macro scores."
+            "including status counts, route counts, and per-route/micro/macro scores "
+            "plus micro score distributions."
         ),
     )
     return parser

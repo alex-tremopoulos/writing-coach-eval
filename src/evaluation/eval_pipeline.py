@@ -96,9 +96,22 @@ SCORE_FIELD_LABELS = {
     "correctness_score": CORRECTNESS_METRIC_NAME,
 }
 
+NON_RESPONSE_STATUS = "NO_RESPONSE"
+
 REMOVAL_REQUEST_RE = re.compile(
     r"\b(remove|delete|delet(e|ion)|omit|drop|cut|trim|erase|exclude|eliminate|strip out|take out)\b"
     r"|\b(blank lines?|empty lines?|line breaks?|newlines?)\b",
+    re.IGNORECASE,
+)
+
+NON_RESPONSE_SPECIFICITY_RE = re.compile(
+    r"\b(could you|please)\s+be more specific\b",
+    re.IGNORECASE,
+)
+
+NON_RESPONSE_FAILURE_RE = re.compile(
+    r"\b(could(?:n't| not)|did(?:n't| not)|unable to)\s+"
+    r"(?:identify|find)\b[^\n.?!]*\b(improvements?|changes?|edits?)\b",
     re.IGNORECASE,
 )
 
@@ -106,6 +119,29 @@ REMOVAL_REQUEST_RE = re.compile(
 def _is_removal_request(query: str) -> bool:
     """Return True when the user command is primarily asking to remove content."""
     return bool(REMOVAL_REQUEST_RE.search(query or ""))
+
+
+def _is_non_response_output(response_text: str, suggestions: list[dict[str, Any]] | None = None) -> bool:
+    """Return True for fallback outputs that ask the user for more specific instructions.
+
+    These cases are system non-responses rather than meaningful outputs and
+    should be excluded from scoring.
+    """
+    if suggestions:
+        return False
+
+    text = (response_text or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if "i analyzed your text" in lowered and NON_RESPONSE_SPECIFICITY_RE.search(text):
+        return True
+
+    return bool(
+        NON_RESPONSE_SPECIFICITY_RE.search(text)
+        and NON_RESPONSE_FAILURE_RE.search(text)
+    )
 
 
 def _suggestion_has_payload(suggestion: dict[str, Any]) -> bool:
@@ -245,19 +281,21 @@ def _is_revise_route(route: str) -> bool:
     return route.upper().startswith("REVISE")
 
 
+def _should_include_correctness(response_route: str, has_suggestions: bool) -> bool:
+    """Return True when Correctness should be evaluated for the actual response route."""
+    return _is_revise_route(response_route) and has_suggestions
+
+
 def _should_force_zero_correctness(row: dict[str, Any]) -> bool:
     """Flag clearly invalid empty revisions for deterministic Correctness=0.
 
     Returns True when:
     - All retained suggestions have empty transformed_text AND is not a removal request.
-    - The route is REVISE_* but there are zero suggestions AND is not a removal request.
     """
     is_removal = bool(row.get("is_removal_request"))
     if is_removal:
         return False
     if bool(row.get("has_suggestions")) and not bool(row.get("has_nonempty_transformed_text")):
-        return True
-    if _is_revise_route(row.get("route", "")) and not bool(row.get("has_suggestions")):
         return True
     return False
 
@@ -499,10 +537,10 @@ def _extract_metric_scores(evaluation: list[dict[str, Any]]) -> dict[str, int | 
     return scores
 
 
-def _required_score_fields(has_suggestions: bool, is_revise_route: bool = False) -> list[str]:
+def _required_score_fields(include_correctness: bool = False) -> list[str]:
     """Return the metric score fields expected for a given row."""
     required = ["output_relevancy_score", "completeness_score"]
-    if has_suggestions or is_revise_route:
+    if include_correctness:
         required.append("correctness_score")
     return required
 
@@ -513,6 +551,19 @@ def _avg_std(scores: list) -> tuple[float, float]:
         return float("nan"), 0.0
     avg = sum(scores) / len(scores)
     return avg, (statistics.stdev(scores) if len(scores) >= 2 else 0.0)
+
+
+def _score_distribution(scores: list[int]) -> dict[int, dict[str, float | int]]:
+    """Return count and percentage for each discrete score value 0, 1, and 2."""
+    total = len(scores)
+    counts = Counter(score for score in scores if score in (0, 1, 2))
+    return {
+        score: {
+            "count": counts.get(score, 0),
+            "pct": (counts.get(score, 0) / total * 100.0) if total else 0.0,
+        }
+        for score in (0, 1, 2)
+    }
 
 
 def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -556,6 +607,11 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
             "output_relevancy": _avg_std(all_rel),
             "completeness": _avg_std(all_comp),
             "correctness": _avg_std(all_correctness),
+            "distributions": {
+                "output_relevancy_score": _score_distribution(all_rel),
+                "completeness_score": _score_distribution(all_comp),
+                "correctness_score": _score_distribution(all_correctness),
+            },
         },
         "macro": {
             "n_routes": len(route_buckets),
@@ -569,6 +625,14 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
             "correctness": _avg_std(route_correctness_avgs),
         },
     }
+
+
+def _format_distribution(distribution: dict[int, dict[str, float | int]]) -> str:
+    """Render a score distribution as a compact 0/1/2 percentage summary."""
+    return "  ".join(
+        f"{score}={distribution[score]['pct']:.1f}% (n={distribution[score]['count']})"
+        for score in (0, 1, 2)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -693,17 +757,24 @@ def load_input_data(
         has_nonempty_transformed_text = any(
             _suggestion_has_nonempty_transformed_text(s) for s in suggestions
         )
+        response_route = str(
+            output_data.get("route")
+            or row.get("route_orch")
+            or row.get(route_col, "UNKNOWN")
+        )
 
         rows.append({
             "row_id": int(row["row_id"]),
             "query": str(row.get("query", "")),
             "input": str(row.get("input", "")),
             "route": str(row.get(route_col, "UNKNOWN")),
+            "response_route": response_route,
             "response_text": response_text,
             "suggestions": suggestions,
             "has_suggestions": len(suggestions) > 0,
             "has_nonempty_transformed_text": has_nonempty_transformed_text,
             "is_removal_request": _is_removal_request(str(row.get("query", ""))),
+            "is_non_response": _is_non_response_output(response_text, suggestions),
         })
 
     logger.info("Loaded %d rows from %s", len(rows), input_path)
@@ -873,6 +944,15 @@ async def process_row(
         try:
             logger.info("Row %d: processing (route=%s)", row_id, row["route"])
 
+            if row.get("is_non_response"):
+                logger.info("Row %d: excluded from scoring due to non-response fallback output", row_id)
+                result["status"] = NON_RESPONSE_STATUS
+                result["overall_notes"] = (
+                    "Excluded from evaluation because the system returned a fallback "
+                    "request for more specific instructions instead of a meaningful response."
+                )
+                return result
+
             # ---- Stage 1: Generate Rubrics ----
             if rubrics_mode == "split":
                 # Two separate LLM calls, one per metric, then merge rubrics.
@@ -985,15 +1065,17 @@ async def process_row(
                 is_removal_request=row.get("is_removal_request", False),
             )
 
+            include_correctness = _should_include_correctness(
+                row.get("response_route", ""),
+                bool(row.get("has_suggestions")),
+            )
+
             judge_system, judge_user = build_judge_prompts(
                 user_query=row["query"],
                 input_text=row["input"],
                 output_text=output_for_judge,
                 rubrics=rubrics_str,
-                include_correctness=(
-                    bool(row.get("has_suggestions"))
-                    or _is_revise_route(row.get("route", ""))
-                ),
+                include_correctness=include_correctness,
             )
 
             judge_response = await call_llm(
@@ -1021,13 +1103,13 @@ async def process_row(
             metric_scores = _extract_metric_scores(evaluation)
             result.update(metric_scores)
 
+            if not include_correctness:
+                result["correctness_score"] = None
+
             if _should_force_zero_correctness(row):
                 result["correctness_score"] = 0
 
-            required_score_fields = _required_score_fields(
-                bool(row.get("has_suggestions")),
-                is_revise_route=_is_revise_route(row.get("route", "")),
-            )
+            required_score_fields = _required_score_fields(include_correctness=include_correctness)
             if any(result.get(field) is None for field in required_score_fields):
                 logger.warning("Row %d: Judge response missing one or more metric scores", row_id)
                 result["status"] = "JUDGE_INCOMPLETE"
@@ -1405,7 +1487,18 @@ def _print_summary(
     print("\n" + "=" * 80)
     print("EVALUATION SUMMARY")
     print("=" * 80)
-    print(f"Total rows evaluated: {len(results)}")
+    total_rows = len(results)
+    excluded_non_response = sum(1 for r in results if r["status"] == NON_RESPONSE_STATUS)
+    scored_rows = total_rows - excluded_non_response
+    excluded_pct = (excluded_non_response / total_rows * 100.0) if total_rows else 0.0
+
+    print(f"Total rows processed: {total_rows}")
+    print(f"Rows included in scoring: {scored_rows}")
+    if excluded_non_response:
+        print(
+            f"No-response rows excluded: {excluded_non_response} "
+            f"({excluded_pct:.1f}%)"
+        )
     print(f"Elapsed time: {elapsed:.1f}s")
     print()
 
@@ -1430,7 +1523,7 @@ def _print_summary(
             comp_avg, comp_std = s["completeness"]
             corr_avg, corr_std = s["correctness"]
             correctness_text = (
-                f"  Correctness={corr_avg:.3f} (±{corr_std:.3f})"
+                f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={s['counts']['correctness_score']}]"
                 if s["counts"]["correctness_score"] > 0
                 else "  Correctness=N/A"
             )
@@ -1446,7 +1539,7 @@ def _print_summary(
         comp_avg, comp_std = micro["completeness"]
         corr_avg, corr_std = micro["correctness"]
         micro_correctness_text = (
-            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f})"
+            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={micro['counts']['correctness_score']}]"
             if micro["counts"]["correctness_score"] > 0
             else "  Correctness=N/A"
         )
@@ -1455,11 +1548,24 @@ def _print_summary(
             f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
             f"{micro_correctness_text}  n={micro['n']}"
         )
+        print(
+            f"    Output Relevancy distribution: "
+            f"{_format_distribution(micro['distributions']['output_relevancy_score'])}"
+        )
+        print(
+            f"    Completeness distribution:     "
+            f"{_format_distribution(micro['distributions']['completeness_score'])}"
+        )
+        if micro["counts"]["correctness_score"] > 0:
+            print(
+                f"    Correctness distribution:      "
+                f"{_format_distribution(micro['distributions']['correctness_score'])}"
+            )
         rel_avg, rel_std = macro["output_relevancy"]
         comp_avg, comp_std = macro["completeness"]
         corr_avg, corr_std = macro["correctness"]
         macro_correctness_text = (
-            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f})"
+            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={macro['counts']['correctness_score']}]"
             if macro["counts"]["correctness_score"] > 0
             else "  Correctness=N/A"
         )
@@ -1543,6 +1649,12 @@ def _log_to_mlflow(
         status_counts = Counter(r["status"] for r in results)
         mlflow.log_metric("total_rows", len(results))
         mlflow.log_metric("ok_rows", status_counts.get("OK", 0))
+        mlflow.log_metric("no_response_rows", status_counts.get(NON_RESPONSE_STATUS, 0))
+        if results:
+            mlflow.log_metric(
+                "no_response_pct",
+                status_counts.get(NON_RESPONSE_STATUS, 0) / len(results) * 100.0,
+            )
         mlflow.log_metric("elapsed_seconds", round(elapsed, 1))
         for status, count in status_counts.items():
             mlflow.log_metric(f"status_{status.lower()}_count", count)
@@ -1572,6 +1684,17 @@ def _log_to_mlflow(
                         avg, std = ls[metric]
                         mlflow.log_metric(f"{level}_{metric}_avg", avg)
                         mlflow.log_metric(f"{level}_{metric}_std", std)
+                        if level == "micro":
+                            distribution = ls["distributions"][score_field]
+                            for score in (0, 1, 2):
+                                mlflow.log_metric(
+                                    f"{level}_{metric}_score_{score}_pct",
+                                    distribution[score]["pct"],
+                                )
+                                mlflow.log_metric(
+                                    f"{level}_{metric}_score_{score}_count",
+                                    distribution[score]["count"],
+                                )
 
         # ---- Artifacts: actual result data ----
         artifact_paths = [results_csv, details_jsonl, *(enriched_paths or [])]
