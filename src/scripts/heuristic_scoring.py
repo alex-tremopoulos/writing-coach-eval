@@ -27,6 +27,7 @@ import argparse
 import csv
 import json
 import math
+import statistics
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,12 @@ IMPORTANCE_WEIGHTS = {
 	"medium": 2.0,
 	"high": 3.0,
 }
+
+def _stdev(scores: list[float]) -> float | None:
+	"""Return the sample standard deviation, or None if fewer than two data points."""
+	if len(scores) < 2:
+		return None
+	return round(statistics.stdev(scores), 6)
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,6 +214,8 @@ def analyze_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict
 			"coefficient_patterns": Counter(),
 			"heuristic_score_sum": 0.0,
 			"llm_judge_score_sum": 0.0,
+			"heuristic_scores": [],
+			"llm_judge_scores": [],
 		}
 		for metric_name in METRIC_SCORE_FIELDS
 	}
@@ -255,6 +264,8 @@ def analyze_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict
 			summary_bucket["coefficient_patterns"][tuple(round(value, 6) for value in coefficients)] += 1
 			summary_bucket["heuristic_score_sum"] += heuristic_score
 			summary_bucket["llm_judge_score_sum"] += actual_score
+			summary_bucket["heuristic_scores"].append(heuristic_score)
+			summary_bucket["llm_judge_scores"].append(float(actual_score))
 
 		if row_has_scores:
 			scored_rows += 1
@@ -283,7 +294,9 @@ def analyze_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict
 			"mean_absolute_error": (bucket["absolute_error_sum"] / count if count else None),
 			"mean_signed_error": (bucket["signed_error_sum"] / count if count else None),
 			"heuristic_score_mean": (bucket["heuristic_score_sum"] / count if count else None),
+			"heuristic_score_std": _stdev(bucket["heuristic_scores"]),
 			"llm_judge_score_mean": (bucket["llm_judge_score_sum"] / count if count else None),
+			"llm_judge_score_std": _stdev(bucket["llm_judge_scores"]),
 			"llm_judge_score_distribution": dict(sorted(bucket["llm_judge_score_distribution"].items())),
 			"item_count_distribution": dict(sorted(bucket["item_count_distribution"].items())),
 			"importance_pattern_distribution": {
@@ -314,11 +327,12 @@ def print_summary(summary: dict[str, Any], input_path: Path) -> None:
 		print(f"[{metric_name}]")
 		print(f"Count: {metric_summary['count']}")
 		if metric_summary["mean_absolute_error"] is not None:
-			print(
-				"Heuristic score mean: "
-				f"{metric_summary['heuristic_score_mean']:.3f}"
-			)
-			print(f"LLM-Judge score mean: {metric_summary['llm_judge_score_mean']:.3f}")
+			heuristic_std = metric_summary["heuristic_score_std"]
+			heuristic_std_str = f" ± {heuristic_std:.3f}" if heuristic_std is not None else ""
+			print(f"Heuristic score mean: {metric_summary['heuristic_score_mean']:.3f}{heuristic_std_str}")
+			llm_std = metric_summary["llm_judge_score_std"]
+			llm_std_str = f" ± {llm_std:.3f}" if llm_std is not None else ""
+			print(f"LLM-Judge score mean: {metric_summary['llm_judge_score_mean']:.3f}{llm_std_str}")
 			print(f"Mean absolute error: {metric_summary['mean_absolute_error']:.3f}")
 			print(f"Mean signed error: {metric_summary['mean_signed_error']:.3f}")
 		print(f"Item counts: {metric_summary['item_count_distribution']}")
