@@ -18,14 +18,136 @@ import csv
 import json
 import sys
 import time
+import types
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
 from collections import Counter
 
 from src.graph_presets import get_preset, register_preset
-from src.presets_config import get_preset_config
+from src.presets_config import PRESET_CONFIGS, get_preset_config
 from src.state_definitions import WritingCoachV2State
+
+
+def _install_learning_formatter_shim() -> None:
+    """Provide the legacy learning_formatters module expected by WC V2 nodes."""
+    module_name = 'src.tools.search.learning_formatters'
+    if module_name in sys.modules:
+        return
+
+    from src.tools.search.llm_formatters import format_llm_results
+
+    shim = types.ModuleType(module_name)
+
+    def format_documents_for_learnings(results, include_reference_prefix=True):
+        return format_llm_results(
+            results,
+            include_reference_prefix=include_reference_prefix,
+        )
+
+    shim.format_documents_for_learnings = format_documents_for_learnings
+    shim.__all__ = ['format_documents_for_learnings']
+    sys.modules[module_name] = shim
+
+
+def _coerce_llm_text_result(result: Any) -> Any:
+    """Convert LangChain message objects to plain text for legacy WC V2 consumers."""
+    if isinstance(result, (dict, list, str)) or result is None:
+        return result
+
+    content = getattr(result, 'content', None)
+    if content is None:
+        return result
+
+    if isinstance(content, list):
+        return ' '.join(
+            part.get('text', '') if isinstance(part, dict) else str(part)
+            for part in content
+        ).strip()
+
+    if isinstance(content, str):
+        return content
+
+    return str(content)
+
+
+def _install_invoke_llm_shim() -> None:
+    """Normalize invoke_llm outputs for legacy WC V2 code used by this batch script."""
+    import src.utils.llm_utils as llm_utils
+
+    if getattr(llm_utils.invoke_llm, '_store_output_shimmed', False):
+        return
+
+    original_invoke_llm = llm_utils.invoke_llm
+
+    def invoke_llm_compat(*args, **kwargs):
+        result = original_invoke_llm(*args, **kwargs)
+        response_format = kwargs.get('response_format', 'text')
+        if response_format == 'json_object' or (
+            isinstance(response_format, dict) and response_format.get('type') == 'json_object'
+        ):
+            return result
+        if kwargs.get('stream') and not kwargs.get('writer'):
+            return result
+        return _coerce_llm_text_result(result)
+
+    invoke_llm_compat._store_output_shimmed = True
+    llm_utils.invoke_llm = invoke_llm_compat
+
+
+def _build_writing_coach_v2_config() -> Dict[str, Any]:
+    """Build a standalone WC V2 config without requiring a repo-wide preset entry."""
+    copilot_config = get_preset_config('copilot_2_v4')
+    copilot_models = dict(copilot_config.get('models', {}))
+    copilot_prompts = dict(copilot_config.get('prompts', {}))
+    copilot_parameters = dict(copilot_config.get('parameters', {}))
+
+    return {
+        'display_name': 'Writing Coach V2',
+        'description': 'Standalone batch config for Writing Coach V2',
+        'mode_indicator': 'Writing Coach V2',
+        'type': 'writing_coach',
+        'expose_in_ui': False,
+        'tools': copilot_config.get('tools', {}),
+        'parameters': {
+            **copilot_parameters,
+            'preset': 'writing_coach_v2',
+            'copilot_preset': 'copilot_2_v4',
+            'document_search_limit': copilot_parameters.get('document_search_limit', 20),
+            'supports_conversation': True,
+            'conversation_turn_limit': 10,
+        },
+        'prompts': {
+            **copilot_prompts,
+            'wc_orchestrator': 'v2',
+            'wc_respond': 'v2',
+            'wc_segment_analysis': 'v1',
+            'research_response': 'v1',
+            'parallel_research_transform': 'v1',
+            'parallel_simple_transform': 'v1',
+            'revision_explanation': 'v1',
+        },
+        'models': {
+            **copilot_models,
+            'orchestrator': copilot_models.get('orchestrator', 'gpt-5.1-chat'),
+            'research_response': copilot_models.get('copilot_summary_standard', 'gpt-5.1-chat'),
+            'structured_transform': 'gpt-5.1-chat',
+            'text_transformation': 'gpt-5.1-chat',
+            'respond': copilot_models.get('copilot_reinterpret', 'gpt-5.1-chat'),
+            'segment_analysis': 'gpt-5-mini',
+            'search_parameter_extraction': copilot_models.get('search_parameter_extraction', 'gpt-5.1-chat'),
+            'learnings_extraction': copilot_models.get('learnings_extraction', 'gpt-5-mini'),
+        },
+    }
+
+
+def _install_writing_coach_v2_config() -> Dict[str, Any]:
+    """Register a runtime-only WC V2 preset config for the batch script."""
+    config = PRESET_CONFIGS.get('writing_coach_v2')
+    if config is None:
+        config = _build_writing_coach_v2_config()
+        PRESET_CONFIGS['writing_coach_v2'] = config
+    return config
 
 
 def _initialize_writing_coach_v2_only():
@@ -97,10 +219,12 @@ def _initialize_writing_coach_v2_only():
 
 # Initialize ONLY writing_coach_v2
 print("Initializing Writing Coach V2...")
+_install_learning_formatter_shim()
+_install_invoke_llm_shim()
+preset_config = _install_writing_coach_v2_config()
 _initialize_writing_coach_v2_only()
 builder = get_preset("writing_coach_v2")
 graph = builder.build_without_checkpointing()
-preset_config = get_preset_config("writing_coach_v2")
 
 
 def run_query(row_id: int, query: str, document_text: str) -> Dict[str, Any]:
