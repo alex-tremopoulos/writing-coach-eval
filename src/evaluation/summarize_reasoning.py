@@ -9,7 +9,7 @@ from openai import AzureOpenAI
 
 load_dotenv()
 
-DATA_DIR = Path("eval_data/wcv2_one_prompt/route_intended/0327_1342")
+DATA_DIR = Path("eval_data/wcv2_one_prompt/route_intended/0327_1342/metrics_scores_combinations")
 METRICS = ["output_relevancy", "completeness", "correctness"]
 SCORES = [0, 1, 2]
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat-2025-10-03")
