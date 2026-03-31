@@ -9,7 +9,7 @@ from openai import AzureOpenAI
 
 load_dotenv()
 
-DATA_DIR = Path("eval_data/wcv2_one_prompt/route_intended/0327_1342/metrics_scores_combinations")
+DATA_DIR = Path("eval_data/wcv2_one_prompt/route_intended/0327_1342/metrics_scores_combinations/item_level")
 METRICS = ["output_relevancy", "completeness", "correctness"]
 SCORES = [0, 1, 2]
 DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-chat-2025-10-03")
@@ -20,20 +20,26 @@ USER_PROMPTS = {
     0: (
         "Below are the reasoning explanations for all cases that received a score of 0 (worst) "
         "on the '{metric}' metric.\n\n{reasonings}\n\n"
-        "Summarize the common patterns explaining why these cases scored poorly. "
-        "What recurring issues or input characteristics led to failure?"
+        "Summarize the common patterns in these cases. Focus primarily on recurring issues "
+        "and input characteristics that led to failure, but also note any positive aspects "
+        "the system still exhibited despite the low score.\n\n"
+        "Format your response as bullet points, grouped under '### Weaknesses' and '### Strengths' headings."
     ),
     1: (
         "Below are the reasoning explanations for all cases that received a score of 1 (partial) "
         "on the '{metric}' metric.\n\n{reasonings}\n\n"
-        "Summarize the common patterns among these partially-successful cases. "
-        "What recurring gaps or input characteristics prevented a perfect score?"
+        "Summarize the common patterns in these partially-successful cases. Cover both "
+        "the recurring gaps that prevented a perfect score and the positive behaviors "
+        "the system demonstrated.\n\n"
+        "Format your response as bullet points, grouped under '### Weaknesses' and '### Strengths' headings."
     ),
     2: (
         "Below are the reasoning explanations for all cases that received a score of 2 (perfect) "
         "on the '{metric}' metric.\n\n{reasonings}\n\n"
-        "Summarize the common patterns in these successful cases. "
-        "What good behaviors does the system consistently exhibit?"
+        "Summarize the common patterns in these successful cases. Focus primarily on "
+        "the good behaviors the system consistently exhibits, but also note any minor "
+        "weaknesses or areas for improvement mentioned despite the perfect score.\n\n"
+        "Format your response as bullet points, grouped under '### Strengths' and '### Weaknesses' headings."
     ),
 }
 
@@ -67,7 +73,7 @@ def main():
 
     for metric in METRICS:
         for score in SCORES:
-            path = DATA_DIR / f"{metric}_score_{score}.json"
+            path = DATA_DIR / f"{metric}_items_score_{score}.json"
             if not path.exists():
                 print(f"SKIP (not found): {path}")
                 continue
