@@ -4,12 +4,11 @@ Two-stage async LLM pipeline:
   Stage 1 — Rubrics Generator: produces rubric items from (query, input, route)
   Stage 2 — Rubrics Judge: scores each rubric item against the system output
 
-Uses LangChain AzureChatOpenAI for async LLM calls with built-in retry,
-and writes results incrementally as CSV + JSONL for resume support.
+Uses LangChain AzureChatOpenAI with built-in retry, writes results incrementally
+as CSV + JSONL for resume support.
 
 Usage:
   python -m src.evaluation.eval_pipeline --input final_data/all_results.csv --limit 5
-  python -m src.evaluation.eval_pipeline --deployment gpt-4o --concurrency 3
   python -m src.evaluation.eval_pipeline --routes RESEARCH RESPOND --limit 10
 """
 
@@ -46,7 +45,6 @@ from src.constants.metrics_definitions import CORRECTNESS_METRIC_NAME, METRICS_D
 
 load_dotenv()
 
-# Disable LangSmith tracing — avoids SSL noise when no LangSmith access is configured
 os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
 
 logger = logging.getLogger("eval_pipeline")
@@ -55,7 +53,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-# Suppress noisy third-party loggers
 logging.getLogger("langsmith").setLevel(logging.ERROR)
 logging.getLogger("langchain").setLevel(logging.WARNING)
 
@@ -63,10 +60,9 @@ DEFAULT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_CONCURRENCY = 5
-MAX_RETRIES = 3  # passed to LangChain AzureChatOpenAI max_retries
+MAX_RETRIES = 3
 DEFAULT_INPUT = "final_data/all_results.csv"
 
-# All columns written to CSV for each evaluated row
 EVAL_CSV_FIELDNAMES = [
     "row_id",
     "route",
@@ -79,7 +75,7 @@ EVAL_CSV_FIELDNAMES = [
     "generator_raw_response",
     "rubrics_json",
     "rubrics_reasoning",
-    "evaluation_items_json",  # evaluation_items extracted per metric from rubrics
+    "evaluation_items_json",
     "judge_raw_response",
     "verdicts_json",
 ]
@@ -95,6 +91,9 @@ SCORE_FIELD_LABELS = {
     "completeness_score": "Completeness",
     "correctness_score": CORRECTNESS_METRIC_NAME,
 }
+
+# Short keys used to DRY metric loops in stats/summary code
+METRIC_KEYS = ("output_relevancy", "completeness", "correctness")
 
 NON_RESPONSE_STATUS = "NO_RESPONSE"
 
@@ -152,13 +151,12 @@ def _suggestion_has_payload(suggestion: dict[str, Any]) -> bool:
     """
     if not isinstance(suggestion, dict):
         return False
-    if suggestion.get("original_text") is not None:
-        return True
-    if suggestion.get("transformed_text") is not None:
-        return True
-    if str(suggestion.get("explanation") or "").strip():
-        return True
-    return isinstance(suggestion.get("char_start"), int) and isinstance(suggestion.get("char_end"), int)
+    return (
+        suggestion.get("original_text") is not None
+        or suggestion.get("transformed_text") is not None
+        or str(suggestion.get("explanation") or "").strip() != ""
+        or (isinstance(suggestion.get("char_start"), int) and isinstance(suggestion.get("char_end"), int))
+    )
 
 
 def _suggestion_has_nonempty_transformed_text(suggestion: dict[str, Any]) -> bool:
@@ -276,28 +274,20 @@ def _format_text_for_judge(text: Any, empty_label: str) -> str:
     return text
 
 
-def _is_revise_route(route: str) -> bool:
-    """Return True for REVISE_SIMPLE and REVISE_RESEARCH routes."""
-    return route.upper().startswith("REVISE")
-
-
 def _should_include_correctness(response_route: str, has_suggestions: bool) -> bool:
     """Return True when Correctness should be evaluated for the actual response route."""
-    return _is_revise_route(response_route) and has_suggestions
+    return response_route.upper().startswith("REVISE") and has_suggestions
 
 
 def _should_force_zero_correctness(row: dict[str, Any]) -> bool:
     """Flag clearly invalid empty revisions for deterministic Correctness=0.
 
-    Returns True when:
-    - All retained suggestions have empty transformed_text AND is not a removal request.
+    Returns True when all retained suggestions have empty transformed_text
+    AND the query is not a removal request.
     """
-    is_removal = bool(row.get("is_removal_request"))
-    if is_removal:
+    if bool(row.get("is_removal_request")):
         return False
-    if bool(row.get("has_suggestions")) and not bool(row.get("has_nonempty_transformed_text")):
-        return True
-    return False
+    return bool(row.get("has_suggestions")) and not bool(row.get("has_nonempty_transformed_text"))
 
 # ---------------------------------------------------------------------------
 # LangChain Azure OpenAI model (cached per parameter set)
@@ -312,10 +302,7 @@ def get_model(
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> AzureChatOpenAI:
-    """Get or create a cached LangChain AzureChatOpenAI model.
-
-    Re-creates the model only when parameters change.
-    """
+    """Get or create a cached AzureChatOpenAI model (re-creates when params change)."""
     global _model, _model_key
     key = (deployment, temperature, max_tokens)
     if _model is None or _model_key != key:
@@ -348,23 +335,7 @@ async def call_llm(
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> str:
-    """Call Azure OpenAI via LangChain and return the text response.
-
-    LangChain handles retries internally (max_retries on the model).
-
-    Args:
-        deployment: Azure OpenAI deployment name (e.g., 'gpt-4o').
-        system_prompt: System message content.
-        user_prompt: User message content.
-        temperature: Sampling temperature.
-        max_tokens: Maximum tokens in the response.
-
-    Returns:
-        The assistant's response text.
-
-    Raises:
-        Exception: If all retries are exhausted.
-    """
+    """Call Azure OpenAI via LangChain and return the text response."""
     model = get_model(deployment, temperature, max_tokens)
     messages = [
         SystemMessage(content=system_prompt),
@@ -375,11 +346,9 @@ async def call_llm(
 
 
 def parse_json_response(text: str) -> dict | None:
-    """Try to parse a JSON object from an LLM response.
+    """Parse a JSON object from an LLM response.
 
-    Handles common issues like markdown code fences wrapping the JSON.
-    Falls back to ``parse_markdown_rubrics`` if the response looks like the
-    structured Markdown rubrics format produced by rubrics_prompt.txt.
+    Strips markdown code fences and falls back to ``parse_markdown_rubrics``.
     Returns None if all parsing strategies fail.
     """
     # Strip markdown code fences if present
@@ -398,23 +367,16 @@ def parse_json_response(text: str) -> dict | None:
 
 
 def parse_markdown_rubrics(text: str) -> dict | None:
-    """Parse the structured Markdown rubrics format produced by the generator.
+    """Parse the structured Markdown rubrics format (``### Criterion N`` / ``### Metric Rubric N``).
 
-    Supports both the legacy ``### Criterion N: [Name]`` format and the newer
-    ``### Metric Rubric N: [Name]`` format. Returns the normalized
-    ``{"rubrics": [...]}`` structure expected by the rest of the pipeline.
-
-    Returns None if the text does not look like rubrics Markdown.
+    Returns the normalized ``{"rubrics": [...]}`` dict, or None if not rubrics Markdown.
     """
     header_pattern = r"###\s+(?:Criterion|Metric Rubric)\s+\d+:\s*(.+)"
-
-    # Must have at least one rubric header to be considered rubrics Markdown
     rubric_headers = re.findall(header_pattern, text, re.IGNORECASE)
     if not rubric_headers:
         return None
 
     rubrics = []
-    # Split on rubric headers to process each block individually
     blocks = re.split(
         r"(?=###\s+(?:Criterion|Metric Rubric)\s+\d+:)",
         text,
@@ -458,11 +420,9 @@ def parse_markdown_rubrics(text: str) -> dict | None:
 
                 item_text = stripped[1:].strip()
                 item_importance = ""
-                # Extract importance: handles patterns like "(Importance: High)", "(Importance: High).", etc.
                 importance_match = re.search(r"\(Importance:\s*([^)]+)\)", item_text)
                 if importance_match:
                     item_importance = importance_match.group(1).strip()
-                    # Remove the "(Importance: ...)" pattern and any trailing punctuation
                     item_text = re.sub(r"\s*\(Importance:\s*[^)]+\)[.,;:]?\s*$", "", item_text).strip()
 
                 evaluation_items.append({
@@ -470,9 +430,6 @@ def parse_markdown_rubrics(text: str) -> dict | None:
                     "importance": item_importance,
                 })
 
-        # Extract table rows: | Level | Score | Description | Indicators |
-        # Level cells may be bold-formatted and use either the legacy 1-4
-        # labels or the newer metric-specific 0-2 labels.
         levels = []
         table_rows = re.findall(
             r"\|\s*\*{0,2}([^|]+?)\*{0,2}\s*\|\s*(\d+)\s*\|([^|]+)\|([^|]+)\|",
@@ -501,7 +458,6 @@ def parse_markdown_rubrics(text: str) -> dict | None:
     if not rubrics:
         return None
 
-    # Extract any overall reasoning/assessment block
     reasoning = ""
     reasoning_match = re.search(
         r"###\s+Overall Assessment Guidelines(.+?)(?=##|$)", text, re.DOTALL | re.IGNORECASE
@@ -583,46 +539,24 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
         route: {
             "n": b["row_count"],
             "counts": {field: len(b[field]) for field in SCORE_FIELD_LABELS},
-            "output_relevancy": _avg_std(b["output_relevancy_score"]),
-            "completeness": _avg_std(b["completeness_score"]),
-            "correctness": _avg_std(b["correctness_score"]),
+            **{mk: _avg_std(b[f"{mk}_score"]) for mk in METRIC_KEYS},
         }
         for route, b in route_buckets.items()
     }
-    all_rel = [s for b in route_buckets.values() for s in b["output_relevancy_score"]]
-    all_comp = [s for b in route_buckets.values() for s in b["completeness_score"]]
-    all_correctness = [s for b in route_buckets.values() for s in b["correctness_score"]]
-    route_rel_avgs = [_avg_std(b["output_relevancy_score"])[0] for b in route_buckets.values() if b["output_relevancy_score"]]
-    route_comp_avgs = [_avg_std(b["completeness_score"])[0] for b in route_buckets.values() if b["completeness_score"]]
-    route_correctness_avgs = [_avg_std(b["correctness_score"])[0] for b in route_buckets.values() if b["correctness_score"]]
+    all_scores = {mk: [s for b in route_buckets.values() for s in b[f"{mk}_score"]] for mk in METRIC_KEYS}
+    route_avgs = {mk: [_avg_std(b[f"{mk}_score"])[0] for b in route_buckets.values() if b[f"{mk}_score"]] for mk in METRIC_KEYS}
     return {
         "per_route": per_route,
         "micro": {
             "n": len(ok_results),
-            "counts": {
-                "output_relevancy_score": len(all_rel),
-                "completeness_score": len(all_comp),
-                "correctness_score": len(all_correctness),
-            },
-            "output_relevancy": _avg_std(all_rel),
-            "completeness": _avg_std(all_comp),
-            "correctness": _avg_std(all_correctness),
-            "distributions": {
-                "output_relevancy_score": _score_distribution(all_rel),
-                "completeness_score": _score_distribution(all_comp),
-                "correctness_score": _score_distribution(all_correctness),
-            },
+            "counts": {f"{mk}_score": len(all_scores[mk]) for mk in METRIC_KEYS},
+            **{mk: _avg_std(all_scores[mk]) for mk in METRIC_KEYS},
+            "distributions": {f"{mk}_score": _score_distribution(all_scores[mk]) for mk in METRIC_KEYS},
         },
         "macro": {
             "n_routes": len(route_buckets),
-            "counts": {
-                "output_relevancy_score": len(route_rel_avgs),
-                "completeness_score": len(route_comp_avgs),
-                "correctness_score": len(route_correctness_avgs),
-            },
-            "output_relevancy": _avg_std(route_rel_avgs),
-            "completeness": _avg_std(route_comp_avgs),
-            "correctness": _avg_std(route_correctness_avgs),
+            "counts": {f"{mk}_score": len(route_avgs[mk]) for mk in METRIC_KEYS},
+            **{mk: _avg_std(route_avgs[mk]) for mk in METRIC_KEYS},
         },
     }
 
@@ -669,29 +603,8 @@ def load_input_data(
 ) -> list[dict[str, Any]]:
     """Load and filter the input dataset.
 
-    Parses the ``output`` JSON column from all_results.csv to extract:
-    - ``response_text``: the ``output["response"]`` field — for RESPOND/RESEARCH this is
-      the full output to evaluate; for REVISE routes this is a short explanatory note
-      that accompanies the suggestions.
-    - ``suggestions``: list of revision suggestion dicts (original_text, transformed_text, explanation)
-    - ``has_suggestions``: True when at least one suggestion payload exists, including deletions
-    - ``has_nonempty_transformed_text``: True when at least one suggestion proposes replacement text
-    - ``is_removal_request``: True when the user query is asking to delete/remove content
-
-    Args:
-        input_path: Path to all_results.csv (must have an ``output`` JSON column).
-        routes: Optional list of routes to filter by (e.g., ['RESEARCH', 'RESPOND']).
-        limit: Optional max number of rows to process.
-        route_column: Which route column to use: ``'intended'`` (default) for ``route_intended``,
-            or ``'orchestrator'`` for ``route_orch``. If the selected column is missing,
-            falls back to the other column.
-        data_origin: Filter rows by data origin. ``'all'`` (default) keeps all rows.
-            ``'synthetic'`` keeps rows whose ``dataset_source`` starts with ``'Synthetic'``
-            or equals ``'extra_respond_alex'``. ``'natural'`` keeps all other rows.
-
-    Returns:
-        List of row dicts with keys: row_id, query, input, route, response_text,
-        suggestions, has_suggestions.
+    Parses the ``output`` JSON column to extract response_text, suggestions,
+    and derived flags (has_suggestions, is_removal_request, is_non_response).
     """
     df = pd.read_csv(input_path, encoding="utf-8-sig")
 
@@ -737,7 +650,6 @@ def load_input_data(
 
     rows = []
     for _, row in df.iterrows():
-        # Parse the output JSON column
         output_data: dict = {}
         raw_output = row.get("output", "")
         if pd.notna(raw_output) and raw_output:
@@ -748,7 +660,6 @@ def load_input_data(
 
         response_text = str(output_data.get("response", "")).strip() if output_data else ""
 
-        # Keep all meaningful suggestions, including deletions whose transformed_text is empty.
         raw_suggestions = output_data.get("suggestions", []) if output_data else []
         suggestions = [
             s for s in (raw_suggestions or [])
@@ -793,20 +704,8 @@ def _format_output_for_judge(
 ) -> str:
     """Format the writing coach output for the judge LLM.
 
-    For routes with no suggestions (RESPOND, RESEARCH), returns response_text directly —
-    it is the full output to be evaluated.
-    For routes with suggestions (REVISE_SIMPLE, REVISE_RESEARCH), returns a structured block
-    containing the brief response note followed by numbered suggestions.  Each suggestion
-    shows the original passage, the proposed revision, and an explanatory note.
-
-    Args:
-        response_text: The output["response"] field. This is the full response for
-            RESPOND/RESEARCH routes, or a short explanatory note for REVISE routes.
-        suggestions: List of suggestion dicts with keys: original_text, transformed_text,
-            explanation. Empty transformed_text remains meaningful for deletions.
-
-    Returns:
-        A formatted string suitable for the judge_prompt ``{output_text}`` slot.
+    For non-suggestion routes returns response_text directly.
+    For REVISE routes returns a structured block with numbered suggestions.
     """
     if not suggestions:
         return response_text
@@ -835,7 +734,7 @@ def _format_output_for_judge(
         block_lines = [f"#### Suggestion {i}"]
         block_lines.append(f"**Operation Type**: {operation}")
 
-        # Add explicit annotations for operations the judge typically misreads
+        # Add annotations for operations the judge typically misreads
         if operation == "removal":
             orig_str = str(original or "")
             trans_str = str(transformed or "")
@@ -900,26 +799,9 @@ async def process_row(
     temperature: float,
     max_tokens: int,
     semaphore: asyncio.Semaphore,
-    generator_only: bool = False,
     rubrics_mode: str = "combined",
 ) -> dict[str, Any]:
-    """Run Stage 1 (generate rubrics) and optionally Stage 2 (judge rubrics) for one row.
-
-    Args:
-        row: Dict with row_id, query, input, route, response_text, output_data.
-        deployment: Azure OpenAI deployment name.
-        temperature: LLM temperature.
-        max_tokens: Max tokens per LLM call.
-        semaphore: Concurrency limiter.
-        generator_only: If True, stop after Stage 1 and skip the judge.
-        rubrics_mode: ``'combined'`` uses a single LLM call with rubrics_prompt.txt
-            (both metrics together). ``'split'`` makes two separate LLM calls — one
-            per metric — using the metric-specific prompt files, then merges the
-            resulting rubrics before judging.
-
-    Returns:
-        Dict with full evaluation results for this row.
-    """
+    """Run Stage 1 (generate rubrics) and Stage 2 (judge) for one row."""
     row_id = row["row_id"]
     result = {
         "row_id": row_id,
@@ -1042,11 +924,6 @@ async def process_row(
                 result["status"] = "NO_RUBRICS"
                 return result
 
-            # Stop here if only Stage 1 was requested
-            if generator_only:
-                result["status"] = "GENERATOR_ONLY"
-                return result
-
             # Check if we have anything to judge
             if not row["response_text"] and not row.get("has_suggestions"):
                 logger.warning("Row %d: No response text or suggestions to judge", row_id)
@@ -1057,8 +934,6 @@ async def process_row(
 
             rubrics_str = json.dumps(rubrics, indent=2, ensure_ascii=False)
 
-            # Format output: plain text for RESPOND/RESEARCH, structured
-            # suggestions block for REVISE routes (detected by has_suggestions).
             output_for_judge = _format_output_for_judge(
                 response_text=row["response_text"],
                 suggestions=row.get("suggestions", []),
@@ -1093,7 +968,7 @@ async def process_row(
                 result["status"] = "JUDGE_PARSE_ERROR"
                 return result
 
-            # Process per-metric evaluation entries (score 0-2 per metric)
+            # Extract per-metric scores (0-2)
             evaluation = judge_parsed.get("evaluation", [])
             result["verdicts"] = evaluation
             result["overall_notes"] = judge_parsed.get("summary") or (
@@ -1147,7 +1022,6 @@ class OutputWriter:
         self.details_jsonl = output_dir / f"{run_name}_details.jsonl"
         self._lock = asyncio.Lock()
 
-        # Open files in append mode
         csv_is_new = not self.results_csv.exists() or self.results_csv.stat().st_size == 0
         self._csv_file = open(self.results_csv, "a", newline="", encoding="utf-8")
         self._jsonl_file = open(self.details_jsonl, "a", encoding="utf-8")
@@ -1160,7 +1034,6 @@ class OutputWriter:
     async def write_result(self, result: dict[str, Any]) -> None:
         """Write one evaluation result to both CSV and JSONL."""
         async with self._lock:
-            # CSV — all result fields (nested dicts/lists as JSON strings)
             self._csv_writer.writerow({
                 "row_id": result["row_id"],
                 "route": result["route"],
@@ -1199,7 +1072,6 @@ class OutputWriter:
             })
             self._csv_file.flush()
 
-            # JSONL — full details
             self._jsonl_file.write(json.dumps(result, ensure_ascii=False) + "\n")
             self._jsonl_file.flush()
 
@@ -1233,36 +1105,12 @@ async def run_pipeline(
     limit: int | None = None,
     resume: bool = True,
     run_name: str | None = None,
-    generator_only: bool = False,
     rubrics_mode: str = "combined",
     route_column: str = "intended",
     save_local: bool = False,
     data_origin: str = "all",
 ) -> None:
-    """Run the full dynamic rubrics evaluation pipeline.
-
-    Args:
-        input_path: Path to the input CSV (all_results.csv).
-        output_dir: Directory for evaluation output files.
-        deployment: Azure OpenAI deployment name (e.g., 'gpt-4o').
-        temperature: LLM temperature for both generator and judge.
-        max_tokens: Max tokens per LLM call.
-        concurrency: Max parallel LLM calls.
-        routes: Optional list of routes to filter by.
-        limit: Optional max rows to process.
-        resume: If True, skip rows already in the output JSONL.
-        run_name: Optional name for output files. Defaults to timestamp-based name.
-        generator_only: If True, run only Stage 1 (rubrics generation) and skip
-            the judge. Useful for testing or inspecting generated rubrics.
-        rubrics_mode: ``'combined'`` (default) uses a single generator LLM call
-            with both metrics in one prompt.  ``'split'`` makes two parallel calls,
-            one per metric, using the metric-specific prompt files, then merges the
-            rubrics before judging.
-        route_column: Which route column to use: ``'intended'`` (default) for
-            ``route_intended``, or ``'orchestrator'`` for ``route_orch``.
-        data_origin: Filter rows by data origin. ``'all'`` (default) keeps all rows.
-            ``'synthetic'`` or ``'natural'`` filters on the ``dataset_source`` column.
-    """
+    """Run the full dynamic rubrics evaluation pipeline."""
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"eval_{ts}"
@@ -1276,8 +1124,6 @@ async def run_pipeline(
     logger.info("Input:       %s", input_path)
     logger.info("Output dir:  %s", output_dir)
     logger.info("Run name:    %s", run_name)
-    if generator_only:
-        logger.info("Mode:        GENERATOR ONLY (Stage 1, no judge)")
     logger.info("Rubrics mode: %s", rubrics_mode)
     logger.info("Route column: %s", route_column)
     logger.info("Data origin:  %s", data_origin)
@@ -1316,7 +1162,6 @@ async def run_pipeline(
     async def process_and_write(row: dict) -> dict:
         result = await process_row(
             row, deployment, temperature, max_tokens, semaphore,
-            generator_only=generator_only,
             rubrics_mode=rubrics_mode,
         )
         await writer.write_result(result)
@@ -1381,23 +1226,10 @@ def build_enriched_output(
     output_dir: Path,
     run_name: str,
 ) -> tuple[Path, Path] | None:
-    """Copy the evaluated rows from the input file and append eval result columns.
+    """Copy evaluated rows from input and append eval result columns.
 
-    Reads ``all_results_with_final_text`` (the input), filters to only the rows
-    that were evaluated in this run, merges eval results by ``row_id``, and
-    writes two enriched files in ``output_dir``:
-
-    - ``{run_name}_all_results_enriched.csv``
-    - ``{run_name}_all_results_enriched.jsonl``
-
-    Args:
-        input_path: Path to all_results_with_final_text.csv used as pipeline input.
-        details_jsonl: Path to the eval details JSONL for this run.
-        output_dir: Directory where enriched files will be written.
-        run_name: Run name prefix for output files.
-
-    Returns:
-        Tuple of (enriched_csv_path, enriched_jsonl_path), or None on failure.
+    Writes ``{run_name}_all_results_enriched.csv`` and ``.jsonl`` in output_dir.
+    Returns (enriched_csv_path, enriched_jsonl_path), or None on failure.
     """
     # Load eval results indexed by row_id
     eval_by_id: dict[int, dict] = {}
@@ -1476,6 +1308,23 @@ def build_enriched_output(
     return enriched_csv, enriched_jsonl
 
 
+def _format_score_line(label: str, s: dict[str, Any], suffix: str = "") -> str:
+    """Format a single stats row as: label  OR=x.xxx (±y.yyy)  C=...  [Corr=...]  suffix."""
+    rel_avg, rel_std = s["output_relevancy"]
+    comp_avg, comp_std = s["completeness"]
+    corr_avg, corr_std = s["correctness"]
+    corr_text = (
+        f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={s['counts']['correctness_score']}]"
+        if s["counts"]["correctness_score"] > 0
+        else "  Correctness=N/A"
+    )
+    return (
+        f"  {label:20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
+        f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
+        f"{corr_text}{suffix}"
+    )
+
+
 def _print_summary(
     results: list[dict[str, Any]],
     elapsed: float,
@@ -1503,15 +1352,12 @@ def _print_summary(
     print()
 
     # Status breakdown
-
     status_counts = Counter(r["status"] for r in results)
     print("Status breakdown:")
     for status, count in status_counts.most_common():
         print(f"  {status:30} {count:4}")
 
     # Score summary by route
-  
-
     ok_results = [r for r in results if r["status"] == "OK"]
     if ok_results:
         stats = _compute_score_stats(ok_results)
@@ -1519,61 +1365,17 @@ def _print_summary(
         print("Scores by route:")
         for route in sorted(stats["per_route"]):
             s = stats["per_route"][route]
-            rel_avg, rel_std = s["output_relevancy"]
-            comp_avg, comp_std = s["completeness"]
-            corr_avg, corr_std = s["correctness"]
-            correctness_text = (
-                f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={s['counts']['correctness_score']}]"
-                if s["counts"]["correctness_score"] > 0
-                else "  Correctness=N/A"
-            )
-            print(
-                f"  {route:20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
-                f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
-                f"{correctness_text}  n={s['n']}"
-            )
+            print(_format_score_line(route, s, f"  n={s['n']}"))
 
         print()
         micro, macro = stats["micro"], stats["macro"]
-        rel_avg, rel_std = micro["output_relevancy"]
-        comp_avg, comp_std = micro["completeness"]
-        corr_avg, corr_std = micro["correctness"]
-        micro_correctness_text = (
-            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={micro['counts']['correctness_score']}]"
-            if micro["counts"]["correctness_score"] > 0
-            else "  Correctness=N/A"
-        )
-        print(
-            f"  {'OVERALL (micro)':20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
-            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
-            f"{micro_correctness_text}  n={micro['n']}"
-        )
-        print(
-            f"    Output Relevancy distribution: "
-            f"{_format_distribution(micro['distributions']['output_relevancy_score'])}"
-        )
-        print(
-            f"    Completeness distribution:     "
-            f"{_format_distribution(micro['distributions']['completeness_score'])}"
-        )
-        if micro["counts"]["correctness_score"] > 0:
-            print(
-                f"    Correctness distribution:      "
-                f"{_format_distribution(micro['distributions']['correctness_score'])}"
-            )
-        rel_avg, rel_std = macro["output_relevancy"]
-        comp_avg, comp_std = macro["completeness"]
-        corr_avg, corr_std = macro["correctness"]
-        macro_correctness_text = (
-            f"  Correctness={corr_avg:.3f} (±{corr_std:.3f}) [n={macro['counts']['correctness_score']}]"
-            if macro["counts"]["correctness_score"] > 0
-            else "  Correctness=N/A"
-        )
-        print(
-            f"  {'OVERALL (macro)':20} Output Relevancy={rel_avg:.3f} (±{rel_std:.3f})  "
-            f"Completeness={comp_avg:.3f} (±{comp_std:.3f})"
-            f"{macro_correctness_text}  n_routes={macro['n_routes']}"
-        )
+        print(_format_score_line("OVERALL (micro)", micro, f"  n={micro['n']}"))
+        for mk in METRIC_KEYS:
+            sf = f"{mk}_score"
+            if micro["counts"][sf] > 0:
+                label = SCORE_FIELD_LABELS[sf]
+                print(f"    {label + ' distribution:':<30} {_format_distribution(micro['distributions'][sf])}")
+        print(_format_score_line("OVERALL (macro)", macro, f"  n_routes={macro['n_routes']}"))
 
     print()
     if save_local:
@@ -1597,13 +1399,7 @@ def _log_to_mlflow(
     details_jsonl: Path | None = None,
     save_local: bool = False,
 ) -> None:
-    """Log evaluation run parameters and metrics to MLflow.
-
-    Tracking URI is read from the ``MLFLOW_TRACKING_URI`` environment variable
-    (defaults to a local ``mlruns/`` folder if not set). Experiment name is
-    derived from ``rubrics_mode`` so that combined-prompt and split-prompt runs
-    are stored in separate MLflow experiment folders.
-    """
+    """Log evaluation run parameters, metrics, and artifacts to MLflow."""
     rubrics_mode = params.get("rubrics_mode", "combined")
     route_source = params.get("route_column", "intended")  # "intended" or "orchestrator"
     n_total = len(results)
@@ -1615,19 +1411,18 @@ def _log_to_mlflow(
 
     with mlflow.start_run(run_name=mlflow_run_name):
         # ---- Parameters ----
-        mlflow.log_param("deployment", params.get("deployment"))
-        mlflow.log_param("temperature", params.get("temperature"))
-        mlflow.log_param("max_tokens", params.get("max_tokens"))
-        mlflow.log_param("concurrency", params.get("concurrency"))
-        mlflow.log_param("rubrics_mode", rubrics_mode)
-        mlflow.log_param("route_source", route_source)
-        mlflow.log_param("data_origin", params.get("data_origin", "all"))
-        mlflow.log_param("input_path", params.get("input_path"))
-        mlflow.log_param(
-            "routes_filter",
-            json.dumps(params["routes"]) if params.get("routes") else "all",
-        )
-        mlflow.log_param("limit", params.get("limit"))
+        mlflow.log_params({
+            "deployment": params.get("deployment"),
+            "temperature": params.get("temperature"),
+            "max_tokens": params.get("max_tokens"),
+            "concurrency": params.get("concurrency"),
+            "rubrics_mode": rubrics_mode,
+            "route_source": route_source,
+            "data_origin": params.get("data_origin", "all"),
+            "input_path": params.get("input_path"),
+            "routes_filter": json.dumps(params["routes"]) if params.get("routes") else "all",
+            "limit": params.get("limit"),
+        })
 
         # ---- Input dataset ----
         try:
@@ -1789,11 +1584,6 @@ def main():
         help="Disable resume — reprocess all rows even if already in output",
     )
     parser.add_argument(
-        "--generator-only",
-        action="store_true",
-        help="Run Stage 1 only (rubrics generation) — skip the judge. Useful for testing.",
-    )
-    parser.add_argument(
         "--rubrics-mode",
         choices=["combined", "split"],
         default="combined",
@@ -1853,7 +1643,6 @@ def main():
             limit=args.limit,
             resume=not args.no_resume,
             run_name=args.run_name,
-            generator_only=args.generator_only,
             rubrics_mode=args.rubrics_mode,
             route_column=args.route_column,
             save_local=args.save_local,

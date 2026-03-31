@@ -121,10 +121,10 @@ class TestForceZeroCorrectness(unittest.TestCase):
         row = {"has_suggestions": True, "has_nonempty_transformed_text": False, "is_removal_request": True, "route": "REVISE_SIMPLE"}
         self.assertFalse(_should_force_zero_correctness(row))
 
-    def test_force_zero_for_revise_with_zero_suggestions_non_removal(self):
-        """Row 290 pattern: REVISE route, 0 suggestions, not a removal."""
+    def test_no_force_for_revise_with_zero_suggestions_non_removal(self):
+        """REVISE route, 0 suggestions, not a removal — no suggestions means nothing to force."""
         row = {"has_suggestions": False, "has_nonempty_transformed_text": False, "is_removal_request": False, "route": "REVISE_SIMPLE"}
-        self.assertTrue(_should_force_zero_correctness(row))
+        self.assertFalse(_should_force_zero_correctness(row))
 
     def test_no_force_for_revise_with_zero_suggestions_removal(self):
         """Row 275/277 pattern: REVISE route, 0 suggestions, IS a removal."""
