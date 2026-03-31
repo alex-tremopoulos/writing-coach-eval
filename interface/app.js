@@ -1,4 +1,5 @@
 const METRIC_ORDER = ["Output Relevancy", "Completeness", "Correctness"];
+const FALLBACK_RESPONSE_TEXT = "I analyzed your text but couldn't identify specific improvements for that request. Could you be more specific about what you'd like changed?";
 
 const state = {
   examples: [],
@@ -15,6 +16,7 @@ const refs = {
   relevancyScoreFilter: document.getElementById("relevancyScoreFilter"),
   completenessScoreFilter: document.getElementById("completenessScoreFilter"),
   correctnessScoreFilter: document.getElementById("correctnessScoreFilter"),
+  responseTextFilter: document.getElementById("responseTextFilter"),
   rowSelect: document.getElementById("rowSelect"),
   rowCountNote: document.getElementById("rowCountNote"),
   fileStatus: document.getElementById("fileStatus"),
@@ -73,6 +75,13 @@ refs.completenessScoreFilter.addEventListener("change", () => {
 });
 
 refs.correctnessScoreFilter.addEventListener("change", () => {
+  filterExamples();
+  renderStatus();
+  renderFilterControls();
+  renderSelectedExample();
+});
+
+refs.responseTextFilter.addEventListener("change", () => {
   filterExamples();
   renderStatus();
   renderFilterControls();
@@ -210,6 +219,8 @@ function buildExamples(rows) {
 }
 
 function finalizeExample(row, index) {
+  const routeData = extractRouteData(row);
+
   return {
     key: buildExampleKey(row, index),
     rows: [row],
@@ -220,6 +231,7 @@ function finalizeExample(row, index) {
     outputRelevancyScore: firstText(row.eval_output_relevancy_score, ""),
     completenessScore: firstText(row.eval_completeness_score, ""),
     correctnessScore: firstText(row.eval_correctness_score, ""),
+    hasFallbackResponse: matchesFallbackResponse(routeData.responseText),
     query: firstText(row.query, ""),
     inputPreview: firstText(row.input_preview, row.input, "")
   };
@@ -251,6 +263,7 @@ function filterExamples() {
   const relevancyScoreFilter = refs.relevancyScoreFilter.value || "ALL";
   const completenessScoreFilter = refs.completenessScoreFilter.value || "ALL";
   const correctnessScoreFilter = refs.correctnessScoreFilter.value || "ALL";
+  const responseTextFilter = refs.responseTextFilter.value || "ALL";
 
   state.filteredExamples = state.examples.filter((example) => {
     const orchMatch = orchFilter === "ALL" || example.routeOrchValue === orchFilter;
@@ -258,7 +271,8 @@ function filterExamples() {
     const relevancyMatch = relevancyScoreFilter === "ALL" || example.outputRelevancyScore === relevancyScoreFilter;
     const completenessMatch = completenessScoreFilter === "ALL" || example.completenessScore === completenessScoreFilter;
     const correctnessMatch = correctnessScoreFilter === "ALL" || example.correctnessScore === correctnessScoreFilter;
-    return orchMatch && intendedMatch && relevancyMatch && completenessMatch && correctnessMatch;
+    const responseTextMatch = responseTextFilter === "ALL" || (responseTextFilter === "FALLBACK_ONLY" && example.hasFallbackResponse);
+    return orchMatch && intendedMatch && relevancyMatch && completenessMatch && correctnessMatch && responseTextMatch;
   });
 
   if (!state.filteredExamples.some((example) => example.key === state.selectedKey)) {
@@ -936,6 +950,15 @@ function normalizeComparisonText(value) {
     .trim();
 }
 
+function matchesFallbackResponse(value) {
+  const response = firstText(value);
+  if (!response) {
+    return false;
+  }
+
+  return normalizeWhitespace(response).toLowerCase().includes(normalizeWhitespace(FALLBACK_RESPONSE_TEXT).toLowerCase());
+}
+
 function uniqueValues(values) {
   return [...new Set(values.filter((value) => value !== undefined && value !== null && value !== ""))];
 }
@@ -967,6 +990,10 @@ function firstSentence(text) {
 
 function normalizeRouteValue(value) {
   return firstText(value).toUpperCase();
+}
+
+function normalizeWhitespace(value) {
+  return String(value).replace(/\s+/g, " ").trim();
 }
 
 function setFormattedContent(element, value) {
