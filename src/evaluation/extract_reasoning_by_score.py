@@ -1,5 +1,6 @@
 """Extract per-metric, per-score reasoning from enriched eval CSV into JSON files."""
 
+import argparse
 import json
 import pandas as pd
 from collections import defaultdict
@@ -9,8 +10,10 @@ INPUT_CSV = Path("eval_data/wcv2_one_prompt/route_intended/0327_1342/eval_202603
 OUTPUT_DIR = INPUT_CSV.parent
 
 
-def main():
-    df = pd.read_csv(INPUT_CSV)
+def main(input_csv: Path | None = None, output_dir: Path | None = None):
+    csv_path = input_csv or INPUT_CSV
+    out_dir = output_dir or csv_path.parent
+    df = pd.read_csv(csv_path)
 
     # --- Overall metric-level buckets ---
     buckets = defaultdict(list)
@@ -37,14 +40,15 @@ def main():
                 })
 
     # Write overall files
+    out_dir.mkdir(parents=True, exist_ok=True)
     for (metric, score), entries in buckets.items():
         filename = f"{metric}_score_{score}.json"
-        out_path = OUTPUT_DIR / filename
+        out_path = out_dir / filename
         out_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
         print(f"Wrote {len(entries):>3} entries -> {out_path}")
 
     # Write item-level files
-    items_dir = OUTPUT_DIR / "item_level"
+    items_dir = out_dir / "item_level"
     items_dir.mkdir(exist_ok=True)
     for (metric, score), entries in item_buckets.items():
         filename = f"{metric}_items_score_{score}.json"
@@ -54,4 +58,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Extract per-metric, per-score reasoning from enriched eval CSV.")
+    parser.add_argument("--input", type=Path, default=None, help=f"Input enriched CSV (default: {INPUT_CSV})")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory (default: same as input CSV parent)")
+    args = parser.parse_args()
+    main(input_csv=args.input, output_dir=args.output_dir)

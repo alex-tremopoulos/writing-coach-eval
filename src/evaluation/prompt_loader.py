@@ -14,7 +14,7 @@ inside a single file::
     <user prompt content — may contain {slot} placeholders>
     {% endblock %}
 
-Route prompts and constraints are imported from ``src/constants/`` Python dicts
+Route prompts are imported from ``src/constants/`` Python dicts
 rather than individual `.txt` files, enabling version control and code-level editing.
 Route prompts may include a shared ``UNIVERSAL`` block plus a route-specific block.
 """
@@ -24,7 +24,6 @@ from typing import Tuple
 
 from src.constants.metrics_definitions import CORRECTNESS_METRIC_NAME, METRICS_DEFINITION
 from src.constants.route_prompts import ROUTE_PROMPTS
-from src.constants.route_constraints import ROUTE_CONSTRAINTS
 
 # src/prompts/ — one level above src/evaluation/
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
@@ -178,24 +177,6 @@ def load_route_prompt(route: str) -> str:
     return "\n\n".join(prompt_sections)
 
 
-def load_route_constraints(route: str) -> str:
-    """Return the rubrics constraints for a specific route.
-
-    Loaded from the ``ROUTE_CONSTRAINTS`` dict in ``src/constants/route_constraints.py``.
-
-    Args:
-        route: Route name (e.g., 'RESEARCH', 'RESPOND', 'REVISE_SIMPLE', 'REVISE_RESEARCH').
-
-    Returns:
-        Route constraints string, or a placeholder if the route is not defined.
-    """
-    key = route.upper()
-    if key not in ROUTE_CONSTRAINTS:
-        return f"(No specific constraints defined for route: {route})"
-    content = ROUTE_CONSTRAINTS[key]
-    return content if content.strip() else "(No specific constraints defined for this route)"
-
-
 def format_metrics_definition(metrics: dict[str, str] | None = None) -> str:
     """Format the metrics definition dict into a prompt-ready string.
 
@@ -225,7 +206,6 @@ def build_generator_prompts(
     route: str,
     metrics_definition: str | None = None,
     route_prompt: str | None = None,
-    route_rubrics_constraints: str | None = None,
     prompt_file: str = "rubrics_prompt.txt",
 ) -> Tuple[str, str]:
     """Build system and user prompts for the rubrics generator LLM.
@@ -252,9 +232,6 @@ def build_generator_prompts(
         route_prompt: Override string for the ``{route_prompt}`` slot.
             If None, loaded from the shared ``ROUTE_PROMPTS['UNIVERSAL']`` block
             plus ``ROUTE_PROMPTS[route]`` when available.
-        route_rubrics_constraints: Override for route constraints (loaded from
-            ``ROUTE_CONSTRAINTS[route]`` if None). Reserved for future use when
-            the rubrics prompt template includes a ``{route_rubrics_constraints}`` slot.
         prompt_file: Name of the generator prompt file in ``src/prompts/``.
             Defaults to ``'rubrics_prompt.txt'`` (combined, both metrics).
             Use ``'rubrics_prompt_output_relevancy.txt'`` or
@@ -267,11 +244,7 @@ def build_generator_prompts(
         metrics_definition = format_metrics_definition()
     if route_prompt is None:
         route_prompt = load_route_prompt(route)
-    # route_rubrics_constraints is loaded but not yet injected — the current
-    # rubrics_prompt.txt template does not include a {route_rubrics_constraints} slot.
-    # Kept for forward compatibility.
-    if route_rubrics_constraints is None:
-        route_rubrics_constraints = load_route_constraints(route)
+
 
     system_template, user_template = load_combined_prompt(prompt_file)
 

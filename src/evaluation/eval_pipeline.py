@@ -1400,6 +1400,30 @@ def _log_to_mlflow(
     save_local: bool = False,
 ) -> None:
     """Log evaluation run parameters, metrics, and artifacts to MLflow."""
+    try:
+        _log_to_mlflow_inner(
+            results=results,
+            elapsed=elapsed,
+            params=params,
+            enriched_paths=enriched_paths,
+            results_csv=results_csv,
+            details_jsonl=details_jsonl,
+            save_local=save_local,
+        )
+    except Exception as exc:
+        logger.warning("MLflow logging skipped (server may not be running): %s", exc)
+
+
+def _log_to_mlflow_inner(
+    results: list[dict[str, Any]],
+    elapsed: float,
+    params: dict[str, Any],
+    enriched_paths: tuple[Path, Path] | None = None,
+    results_csv: Path | None = None,
+    details_jsonl: Path | None = None,
+    save_local: bool = False,
+) -> None:
+    """Inner MLflow logging — raises on connection errors so the caller can handle them."""
     rubrics_mode = params.get("rubrics_mode", "combined")
     route_source = params.get("route_column", "intended")  # "intended" or "orchestrator"
     n_total = len(results)
