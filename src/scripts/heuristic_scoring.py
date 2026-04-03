@@ -39,6 +39,12 @@ METRIC_SCORE_FIELDS = {
 	"Correctness": ("correctness_score", "eval_correctness_score"),
 }
 
+CANONICAL_METRIC_NAMES = {
+	"output_relevancy": "Output Relevancy",
+	"completeness": "Completeness",
+	"correctness": "Correctness",
+}
+
 VERDICTS_FIELDS = ("verdicts", "eval_verdicts_json", "verdicts_json")
 IMPORTANCE_WEIGHTS = {
 	"low": 1.0,
@@ -61,6 +67,18 @@ def parse_args() -> argparse.Namespace:
 	)
 	parser.add_argument("--input", type=Path, required=True, help="Input JSONL or CSV file")
 	parser.add_argument(
+		"--metrics",
+		"--metric",
+		nargs="+",
+		default=None,
+		choices=list(CANONICAL_METRIC_NAMES),
+		metavar="METRIC",
+		help=(
+			"Subset of metrics to score (default: all verdict metrics present). "
+			"Choices: output_relevancy, completeness, correctness."
+		),
+	)
+	parser.add_argument(
 		"--write-augmented",
 		action="store_true",
 		help="Write an augmented copy of the input rows with heuristic weighted-average score columns",
@@ -78,6 +96,13 @@ def parse_args() -> argparse.Namespace:
 		help="Optional path to write the summary JSON",
 	)
 	return parser.parse_args()
+
+
+def resolve_metric_names(metrics: list[str] | None) -> set[str]:
+	"""Return the display names that should be processed."""
+	if metrics is None:
+		return set(METRIC_SCORE_FIELDS)
+	return {CANONICAL_METRIC_NAMES[metric] for metric in metrics}
 
 
 def parse_json_maybe(value: Any) -> Any:
@@ -200,8 +225,12 @@ def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 	raise ValueError(f"Unsupported output format: {path}")
 
 
-def analyze_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def analyze_rows(
+	rows: list[dict[str, Any]],
+	metrics: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 	augmented_rows: list[dict[str, Any]] = []
+	selected_metric_names = resolve_metric_names(metrics)
 
 	metric_summary: dict[str, dict[str, Any]] = {
 		metric_name: {
@@ -218,6 +247,7 @@ def analyze_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict
 			"llm_judge_scores": [],
 		}
 		for metric_name in METRIC_SCORE_FIELDS
+		if metric_name in selected_metric_names
 	}
 
 	scored_rows = 0
@@ -229,7 +259,11 @@ def analyze_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict
 
 		for verdict in verdicts:
 			metric_name = verdict.get("metric_name")
-			if not isinstance(metric_name, str) or metric_name not in METRIC_SCORE_FIELDS:
+			if (
+				not isinstance(metric_name, str)
+				or metric_name not in METRIC_SCORE_FIELDS
+				or metric_name not in metric_summary
+			):
 				continue
 
 			items = verdict.get("evaluation_items") or []
@@ -348,6 +382,7 @@ def main() -> None:
 	input_path = args.input
 	rows = load_rows(input_path)
 	augmented_rows, summary = analyze_rows(rows)
+	augmented_rows, summary = analyze_rows(rows, metrics=args.metrics)
 
 	print_summary(summary, input_path)
 

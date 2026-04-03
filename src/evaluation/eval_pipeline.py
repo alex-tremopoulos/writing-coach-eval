@@ -95,6 +95,9 @@ SCORE_FIELD_LABELS = {
 # Short keys used to DRY metric loops in stats/summary code
 METRIC_KEYS = ("output_relevancy", "completeness", "correctness")
 
+# Canonical metric names accepted by the --metrics CLI argument
+ALL_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
+
 NON_RESPONSE_STATUS = "NO_RESPONSE"
 
 REMOVAL_REQUEST_RE = re.compile(
@@ -493,8 +496,27 @@ def _extract_metric_scores(evaluation: list[dict[str, Any]]) -> dict[str, int | 
     return scores
 
 
-def _required_score_fields(include_correctness: bool = False) -> list[str]:
-    """Return the metric score fields expected for a given row."""
+def _required_score_fields(
+    include_correctness: bool = False,
+    metrics: list[str] | None = None,
+) -> list[str]:
+    """Return the metric score fields expected for a given row.
+
+    When *metrics* is provided, only fields for the selected metrics are required.
+    """
+    if metrics is not None:
+        normalized = {m.lower().replace(" ", "_") for m in metrics}
+        all_fields = [
+            ("output_relevancy_score", "output_relevancy"),
+            ("completeness_score", "completeness"),
+            ("correctness_score", "correctness"),
+        ]
+        required = [
+            field
+            for field, key in all_fields
+            if key in normalized and (field != "correctness_score" or include_correctness)
+        ]
+        return required
     required = ["output_relevancy_score", "completeness_score"]
     if include_correctness:
         required.append("correctness_score")
@@ -800,8 +822,13 @@ async def process_row(
     max_tokens: int,
     semaphore: asyncio.Semaphore,
     rubrics_mode: str = "combined",
+    metrics: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run Stage 1 (generate rubrics) and Stage 2 (judge) for one row."""
+    """Run Stage 1 (generate rubrics) and Stage 2 (judge) for one row.
+
+    When *metrics* is provided, only the specified metrics are evaluated.
+    Accepted values: 'completeness', 'output_relevancy', 'correctness'.
+    """
     row_id = row["row_id"]
     result = {
         "row_id": row_id,
@@ -836,90 +863,124 @@ async def process_row(
                 return result
 
             # ---- Stage 1: Generate Rubrics ----
+            # Build the active subset of prompt-level metrics (excludes Correctness,
+            # which uses fixed rubrics and is handled separately in Stage 2).
+            _metric_name_map = {
+                "output_relevancy": "Output Relevancy",
+                "completeness": "Completeness",
+            }
+            if metrics is not None:
+                _normalized_selected = {m.lower().replace(" ", "_") for m in metrics}
+                _active_metrics = {
+                    display_name: METRICS_DEFINITION[display_name]
+                    for key, display_name in _metric_name_map.items()
+                    if key in _normalized_selected and display_name in METRICS_DEFINITION
+                }
+            else:
+                _active_metrics = dict(METRICS_DEFINITION)
+
             if rubrics_mode == "split":
                 # Two separate LLM calls, one per metric, then merge rubrics.
-                or_metrics_def = format_metrics_definition(
-                    {k: v for k, v in METRICS_DEFINITION.items() if k == "Output Relevancy"}
-                )
-                c_metrics_def = format_metrics_definition(
-                    {k: v for k, v in METRICS_DEFINITION.items() if k == "Completeness"}
-                )
+                _split_configs = []
+                if "Output Relevancy" in _active_metrics:
+                    _split_configs.append(
+                        (
+                            format_metrics_definition({"Output Relevancy": _active_metrics["Output Relevancy"]}),
+                            "rubrics_prompt_output_relevancy.txt",
+                            "output_relevancy",
+                        )
+                    )
+                if "Completeness" in _active_metrics:
+                    _split_configs.append(
+                        (
+                            format_metrics_definition({"Completeness": _active_metrics["Completeness"]}),
+                            "rubrics_prompt_completeness.txt",
+                            "completeness",
+                        )
+                    )
 
-                gen_system_or, gen_user_or = build_generator_prompts(
-                    user_query=row["query"],
-                    input_text=row["input"],
-                    route=row["route"],
-                    metrics_definition=or_metrics_def,
-                    prompt_file="rubrics_prompt_output_relevancy.txt",
-                )
-                gen_system_c, gen_user_c = build_generator_prompts(
-                    user_query=row["query"],
-                    input_text=row["input"],
-                    route=row["route"],
-                    metrics_definition=c_metrics_def,
-                    prompt_file="rubrics_prompt_completeness.txt",
-                )
+                if not _split_configs:
+                    # Only Correctness selected — no generator prompts needed for split mode
+                    rubrics = []
+                    result["rubrics_reasoning"] = ""
+                else:
+                    _gen_calls = [
+                        build_generator_prompts(
+                            user_query=row["query"],
+                            input_text=row["input"],
+                            route=row["route"],
+                            metrics_definition=_metrics_def,
+                            prompt_file=_prompt_file,
+                        )
+                        for _metrics_def, _prompt_file, _ in _split_configs
+                    ]
 
-                gen_response_or, gen_response_c = await asyncio.gather(
-                    call_llm(deployment, gen_system_or, gen_user_or, temperature, max_tokens),
-                    call_llm(deployment, gen_system_c, gen_user_c, temperature, max_tokens),
-                )
-                result["generator_raw_response"] = json.dumps(
-                    {"output_relevancy": gen_response_or, "completeness": gen_response_c},
-                    ensure_ascii=False,
-                )
+                    _gen_responses = await asyncio.gather(
+                        *[call_llm(deployment, sys_p, usr_p, temperature, max_tokens) for sys_p, usr_p in _gen_calls]
+                    )
 
-                gen_parsed_or = parse_json_response(gen_response_or)
-                gen_parsed_c  = parse_json_response(gen_response_c)
+                    _gen_raw = {cfg[2]: resp for cfg, resp in zip(_split_configs, _gen_responses)}
+                    result["generator_raw_response"] = json.dumps(_gen_raw, ensure_ascii=False)
 
-                if gen_parsed_or is None:
-                    logger.warning("Row %d: Failed to parse generator response (Output Relevancy)", row_id)
-                    result["status"] = "GENERATOR_PARSE_ERROR"
-                    return result
-                if gen_parsed_c is None:
-                    logger.warning("Row %d: Failed to parse generator response (Completeness)", row_id)
-                    result["status"] = "GENERATOR_PARSE_ERROR"
-                    return result
+                    _gen_parsed_map: dict[str, dict] = {}
+                    for _key, _resp in _gen_raw.items():
+                        _parsed = parse_json_response(_resp)
+                        if _parsed is None:
+                            logger.warning(
+                                "Row %d: Failed to parse generator response (%s)", row_id, _key
+                            )
+                            result["status"] = "GENERATOR_PARSE_ERROR"
+                            return result
+                        _gen_parsed_map[_key] = _parsed
 
-                rubrics = (
-                    gen_parsed_or.get("rubrics", [])
-                    + gen_parsed_c.get("rubrics", [])
-                )
-                result["rubrics_reasoning"] = json.dumps(
-                    {
-                        "output_relevancy": gen_parsed_or.get("reasoning", ""),
-                        "completeness": gen_parsed_c.get("reasoning", ""),
-                    },
-                    ensure_ascii=False,
-                )
+                    rubrics = []
+                    for _parsed in _gen_parsed_map.values():
+                        rubrics.extend(_parsed.get("rubrics", []))
+
+                    result["rubrics_reasoning"] = json.dumps(
+                        {k: v.get("reasoning", "") for k, v in _gen_parsed_map.items()},
+                        ensure_ascii=False,
+                    )
             else:
-                # combined mode: single LLM call with both metrics
-                gen_system, gen_user = build_generator_prompts(
-                    user_query=row["query"],
-                    input_text=row["input"],
-                    route=row["route"],
-                )
-                gen_response = await call_llm(
-                    deployment=deployment,
-                    system_prompt=gen_system,
-                    user_prompt=gen_user,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                result["generator_raw_response"] = gen_response
+                # combined mode: single LLM call with selected metrics
+                if not _active_metrics:
+                    # Only Correctness selected — skip generator step
+                    rubrics = []
+                    result["rubrics_reasoning"] = ""
+                else:
+                    _combined_metrics_def = format_metrics_definition(_active_metrics)
+                    gen_system, gen_user = build_generator_prompts(
+                        user_query=row["query"],
+                        input_text=row["input"],
+                        route=row["route"],
+                        metrics_definition=_combined_metrics_def,
+                    )
+                    gen_response = await call_llm(
+                        deployment=deployment,
+                        system_prompt=gen_system,
+                        user_prompt=gen_user,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    result["generator_raw_response"] = gen_response
 
-                gen_parsed = parse_json_response(gen_response)
-                if gen_parsed is None:
-                    logger.warning("Row %d: Failed to parse generator response", row_id)
-                    result["status"] = "GENERATOR_PARSE_ERROR"
-                    return result
+                    gen_parsed = parse_json_response(gen_response)
+                    if gen_parsed is None:
+                        logger.warning("Row %d: Failed to parse generator response", row_id)
+                        result["status"] = "GENERATOR_PARSE_ERROR"
+                        return result
 
-                rubrics = gen_parsed.get("rubrics", [])
-                result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
+                    rubrics = gen_parsed.get("rubrics", [])
+                    result["rubrics_reasoning"] = gen_parsed.get("reasoning", "")
 
             result["rubrics"] = rubrics
 
-            if not rubrics:
+            # When only Correctness is selected there are no generated rubrics;
+            # skip the empty-rubrics guard in that case.
+            _only_correctness = bool(metrics) and all(
+                m.lower().replace(" ", "_") == "correctness" for m in metrics
+            )
+            if not rubrics and not _only_correctness:
                 logger.warning("Row %d: Generator produced zero rubrics", row_id)
                 result["status"] = "NO_RUBRICS"
                 return result
@@ -940,7 +1001,11 @@ async def process_row(
                 is_removal_request=row.get("is_removal_request", False),
             )
 
-            include_correctness = _should_include_correctness(
+            _correctness_selected = (
+                metrics is None
+                or any(m.lower().replace(" ", "_") == "correctness" for m in metrics)
+            )
+            include_correctness = _correctness_selected and _should_include_correctness(
                 row.get("response_route", ""),
                 bool(row.get("has_suggestions")),
             )
@@ -981,10 +1046,24 @@ async def process_row(
             if not include_correctness:
                 result["correctness_score"] = None
 
+            # Null-out scores for metrics that were not selected
+            if metrics is not None:
+                _normalized_selected = {m.lower().replace(" ", "_") for m in metrics}
+                _field_to_key = {
+                    "output_relevancy_score": "output_relevancy",
+                    "completeness_score": "completeness",
+                    "correctness_score": "correctness",
+                }
+                for _field, _key in _field_to_key.items():
+                    if _key not in _normalized_selected:
+                        result[_field] = None
+
             if _should_force_zero_correctness(row):
                 result["correctness_score"] = 0
 
-            required_score_fields = _required_score_fields(include_correctness=include_correctness)
+            required_score_fields = _required_score_fields(
+                include_correctness=include_correctness, metrics=metrics
+            )
             if any(result.get(field) is None for field in required_score_fields):
                 logger.warning("Row %d: Judge response missing one or more metric scores", row_id)
                 result["status"] = "JUDGE_INCOMPLETE"
@@ -1109,8 +1188,13 @@ async def run_pipeline(
     route_column: str = "intended",
     save_local: bool = False,
     data_origin: str = "all",
+    metrics: list[str] | None = None,
 ) -> None:
-    """Run the full dynamic rubrics evaluation pipeline."""
+    """Run the full dynamic rubrics evaluation pipeline.
+
+    When *metrics* is provided, only the specified subset of metrics is evaluated.
+    Accepted values: 'completeness', 'output_relevancy', 'correctness'.
+    """
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"eval_{ts}"
@@ -1127,6 +1211,7 @@ async def run_pipeline(
     logger.info("Rubrics mode: %s", rubrics_mode)
     logger.info("Route column: %s", route_column)
     logger.info("Data origin:  %s", data_origin)
+    logger.info("Metrics:      %s", metrics if metrics is not None else "all")
     logger.info("=" * 80)
 
     # Load data
@@ -1163,6 +1248,7 @@ async def run_pipeline(
         result = await process_row(
             row, deployment, temperature, max_tokens, semaphore,
             rubrics_mode=rubrics_mode,
+            metrics=metrics,
         )
         await writer.write_result(result)
         return result
@@ -1216,6 +1302,7 @@ async def run_pipeline(
             "limit": limit,
             "run_name": run_name,
             "data_origin": data_origin,
+            "metrics": metrics,
         },
     )
 
@@ -1400,6 +1487,30 @@ def _log_to_mlflow(
     save_local: bool = False,
 ) -> None:
     """Log evaluation run parameters, metrics, and artifacts to MLflow."""
+    try:
+        _log_to_mlflow_inner(
+            results=results,
+            elapsed=elapsed,
+            params=params,
+            enriched_paths=enriched_paths,
+            results_csv=results_csv,
+            details_jsonl=details_jsonl,
+            save_local=save_local,
+        )
+    except Exception as exc:
+        logger.warning("MLflow logging skipped (server may not be running): %s", exc)
+
+
+def _log_to_mlflow_inner(
+    results: list[dict[str, Any]],
+    elapsed: float,
+    params: dict[str, Any],
+    enriched_paths: tuple[Path, Path] | None = None,
+    results_csv: Path | None = None,
+    details_jsonl: Path | None = None,
+    save_local: bool = False,
+) -> None:
+    """Inner MLflow logging — raises on connection errors so the caller can handle them."""
     rubrics_mode = params.get("rubrics_mode", "combined")
     route_source = params.get("route_column", "intended")  # "intended" or "orchestrator"
     n_total = len(results)
@@ -1628,6 +1739,19 @@ def main():
             "'natural': all other rows."
         ),
     )
+    parser.add_argument(
+        "--metrics",
+        "--metric",
+        nargs="+",
+        default=None,
+        choices=ALL_METRIC_NAMES,
+        metavar="METRIC",
+        help=(
+            f"Subset of metrics to evaluate (default: all). "
+            f"Choices: {', '.join(ALL_METRIC_NAMES)}. "
+            "Example: --metrics completeness output_relevancy"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1647,6 +1771,7 @@ def main():
             route_column=args.route_column,
             save_local=args.save_local,
             data_origin=args.data_origin,
+            metrics=args.metrics,
         )
     )
 

@@ -39,6 +39,17 @@ COMPLETENESS_COLUMN = "eval_completeness_score"
 CORRECTNESS_COLUMN = "eval_correctness_score"
 DATASET_SOURCE_COLUMN = "dataset_source"
 NON_RESPONSE_STATUS = "NO_RESPONSE"
+METRIC_COLUMNS = {
+    "output_relevancy": OUTPUT_RELEVANCY_COLUMN,
+    "completeness": COMPLETENESS_COLUMN,
+    "correctness": CORRECTNESS_COLUMN,
+}
+METRIC_LABELS = {
+    "output_relevancy": "Output Relevancy",
+    "completeness": "Completeness",
+    "correctness": "Correctness",
+}
+ALL_METRIC_NAMES = list(METRIC_COLUMNS)
 
 
 def find_default_input() -> Path | None:
@@ -252,9 +263,40 @@ def build_synthetic_mask(df: pd.DataFrame) -> pd.Series:
     return dataset_source.str.startswith("Synthetic") | dataset_source.isin(SYNTHETIC_EXACT_SOURCES)
 
 
+def resolve_active_metrics(
+    df: pd.DataFrame,
+    metrics: list[str] | None = None,
+) -> list[str]:
+    """Resolve which metrics should be used for aggregation.
+
+    If *metrics* is None, infer active metrics from score columns that contain at
+    least one non-null value on OK rows. This keeps downstream scripts aligned
+    with runs where only a subset of metrics was evaluated.
+    """
+    normalized_requested = metrics or ALL_METRIC_NAMES
+    ok_mask = (
+        df[EVAL_STATUS_COLUMN].fillna("").astype(str).str.upper() == "OK"
+        if EVAL_STATUS_COLUMN in df.columns
+        else pd.Series(True, index=df.index)
+    )
+
+    active_metrics: list[str] = []
+    for metric_key in normalized_requested:
+        column = METRIC_COLUMNS[metric_key]
+        if column not in df.columns:
+            continue
+        if metrics is None:
+            if df.loc[ok_mask, column].notna().any():
+                active_metrics.append(metric_key)
+        else:
+            active_metrics.append(metric_key)
+
+    return active_metrics
+
+
 def normalize_eval_frame(df: pd.DataFrame, route_column: str) -> pd.DataFrame:
     """Return a copy with score columns coerced to numeric and route normalized."""
-    required_columns = [route_column, EVAL_STATUS_COLUMN, OUTPUT_RELEVANCY_COLUMN, COMPLETENESS_COLUMN]
+    required_columns = [route_column, EVAL_STATUS_COLUMN]
     missing = [column for column in required_columns if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(missing)}")
@@ -262,45 +304,71 @@ def normalize_eval_frame(df: pd.DataFrame, route_column: str) -> pd.DataFrame:
     normalized = df.copy()
     normalized[route_column] = normalized[route_column].fillna("UNKNOWN").astype(str)
     normalized[EVAL_STATUS_COLUMN] = normalized[EVAL_STATUS_COLUMN].fillna("MISSING").astype(str)
-    normalized[OUTPUT_RELEVANCY_COLUMN] = pd.to_numeric(normalized[OUTPUT_RELEVANCY_COLUMN], errors="coerce")
-    normalized[COMPLETENESS_COLUMN] = pd.to_numeric(normalized[COMPLETENESS_COLUMN], errors="coerce")
-    if CORRECTNESS_COLUMN in normalized.columns:
-        normalized[CORRECTNESS_COLUMN] = pd.to_numeric(normalized[CORRECTNESS_COLUMN], errors="coerce")
+    for score_column in METRIC_COLUMNS.values():
+        if score_column in normalized.columns:
+            normalized[score_column] = pd.to_numeric(normalized[score_column], errors="coerce")
     return normalized
 
 
-def extract_ok_results(df: pd.DataFrame, route_column: str) -> list[dict[str, Any]]:
+def extract_ok_results(
+    df: pd.DataFrame,
+    route_column: str,
+    metrics: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Convert OK rows with valid scores into the structure expected by the aggregator."""
+    active_metrics = resolve_active_metrics(df, metrics)
+    if not active_metrics:
+        return []
+
     ok_mask = df[EVAL_STATUS_COLUMN].str.upper() == "OK"
-    valid_score_mask = df[OUTPUT_RELEVANCY_COLUMN].notna() & df[COMPLETENESS_COLUMN].notna()
-    selected_columns = [route_column, OUTPUT_RELEVANCY_COLUMN, COMPLETENESS_COLUMN]
-    if CORRECTNESS_COLUMN in df.columns:
-        selected_columns.append(CORRECTNESS_COLUMN)
+    valid_score_mask = pd.Series(False, index=df.index)
+    selected_columns = [route_column]
+    for metric_key in active_metrics:
+        score_column = METRIC_COLUMNS[metric_key]
+        selected_columns.append(score_column)
+        valid_score_mask = valid_score_mask | df[score_column].notna()
     filtered = df.loc[ok_mask & valid_score_mask, selected_columns]
 
     return [
         {
             "route": row[route_column],
-            "output_relevancy_score": float(row[OUTPUT_RELEVANCY_COLUMN]),
-            "completeness_score": float(row[COMPLETENESS_COLUMN]),
+            "output_relevancy_score": (
+                float(row[OUTPUT_RELEVANCY_COLUMN])
+                if OUTPUT_RELEVANCY_COLUMN in filtered.columns and pd.notna(row[OUTPUT_RELEVANCY_COLUMN])
+                else None
+            ),
+            "completeness_score": (
+                float(row[COMPLETENESS_COLUMN])
+                if COMPLETENESS_COLUMN in filtered.columns and pd.notna(row[COMPLETENESS_COLUMN])
+                else None
+            ),
             "correctness_score": (
-                float(row[CORRECTNESS_COLUMN]) if CORRECTNESS_COLUMN in filtered.columns and pd.notna(row[CORRECTNESS_COLUMN]) else None
+                float(row[CORRECTNESS_COLUMN])
+                if CORRECTNESS_COLUMN in filtered.columns and pd.notna(row[CORRECTNESS_COLUMN])
+                else None
             ),
         }
         for _, row in filtered.iterrows()
     ]
 
 
-def summarize_subset(name: str, df: pd.DataFrame, route_column: str) -> dict[str, Any]:
+def summarize_subset(
+    name: str,
+    df: pd.DataFrame,
+    route_column: str,
+    metrics: list[str] | None = None,
+) -> dict[str, Any]:
     """Build counts and score stats for one subset."""
     status_counts = Counter(df[EVAL_STATUS_COLUMN].astype(str)) if EVAL_STATUS_COLUMN in df.columns else Counter()
     route_counts = Counter(df[route_column].astype(str)) if route_column in df.columns else Counter()
-    ok_results = extract_ok_results(df, route_column)
+    active_metrics = resolve_active_metrics(df, metrics)
+    ok_results = extract_ok_results(df, route_column, metrics=active_metrics)
 
     return {
         "name": name,
         "rows": len(df),
         "ok_rows": len(ok_results),
+        "active_metrics": active_metrics,
         "status_counts": dict(status_counts),
         "route_counts": dict(route_counts),
         "score_stats": _compute_score_stats(ok_results),
@@ -376,13 +444,13 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
     included_rows = summary["rows"] - excluded_non_response
 
     print(f"Rows: {summary['rows']}")
-    print(f"Rows included in scoring: {included_rows}")
+    print(f"Rows included in scoring: {summary['ok_rows']}")
     if excluded_non_response:
         print(
             f"No-response rows excluded: {excluded_non_response} "
             f"({excluded_pct:.1f}%)"
         )
-    print(f"OK rows: {summary['ok_rows']}")
+    print(f"Eligible non-no-response rows: {included_rows}")
 
     if summary["status_counts"]:
         print("Status breakdown:")
@@ -395,68 +463,56 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
             print(f"  {route:20} {count:4}")
 
     stats = summary["score_stats"]
+    active_metrics = summary.get("active_metrics", ALL_METRIC_NAMES)
     if not stats["per_route"]:
-        print("No OK rows with valid eval scores were found.")
+        print("No OK rows with valid eval scores were found for the selected metrics.")
         return
 
     print("Scores by route:")
     for route in sorted(stats["per_route"]):
         route_stats = stats["per_route"][route]
-        relevancy_avg, relevancy_std = route_stats["output_relevancy"]
-        completeness_avg, completeness_std = route_stats["completeness"]
-        correctness_avg, correctness_std = route_stats["correctness"]
-        correctness_text = (
-            f"  Correctness={correctness_avg:.3f} (+/-{correctness_std:.3f}) [n={route_stats['counts']['correctness_score']}]"
-            if route_stats["counts"]["correctness_score"] > 0
-            else "  Correctness=N/A"
-        )
-        print(
-            f"  {route:20} Output Relevancy={relevancy_avg:.3f} (+/-{relevancy_std:.3f})  "
-            f"Completeness={completeness_avg:.3f} (+/-{completeness_std:.3f})"
-            f"{correctness_text}  n={route_stats['n']}"
-        )
+        metric_parts: list[str] = []
+        for metric_key in active_metrics:
+            avg_value, std_value = route_stats[metric_key]
+            count = route_stats["counts"][f"{metric_key}_score"]
+            label = METRIC_LABELS[metric_key]
+            metric_parts.append(
+                f"{label}={avg_value:.3f} (+/-{std_value:.3f}) [n={count}]"
+                if count > 0
+                else f"{label}=N/A"
+            )
+        print(f"  {route:20} {'  '.join(metric_parts)}  n={route_stats['n']}")
 
     micro = stats["micro"]
     macro = stats["macro"]
-    micro_rel_avg, micro_rel_std = micro["output_relevancy"]
-    micro_comp_avg, micro_comp_std = micro["completeness"]
-    micro_corr_avg, micro_corr_std = micro["correctness"]
-    macro_rel_avg, macro_rel_std = macro["output_relevancy"]
-    macro_comp_avg, macro_comp_std = macro["completeness"]
-    macro_corr_avg, macro_corr_std = macro["correctness"]
-    micro_correctness_text = (
-        f"  Correctness={micro_corr_avg:.3f} (+/-{micro_corr_std:.3f}) [n={micro['counts']['correctness_score']}]"
-        if micro["counts"]["correctness_score"] > 0
-        else "  Correctness=N/A"
-    )
-    macro_correctness_text = (
-        f"  Correctness={macro_corr_avg:.3f} (+/-{macro_corr_std:.3f}) [n={macro['counts']['correctness_score']}]"
-        if macro["counts"]["correctness_score"] > 0
-        else "  Correctness=N/A"
-    )
-    print(
-        f"  {'OVERALL (micro)':20} Output Relevancy={micro_rel_avg:.3f} (+/-{micro_rel_std:.3f})  "
-        f"Completeness={micro_comp_avg:.3f} (+/-{micro_comp_std:.3f})"
-        f"{micro_correctness_text}  n={micro['n']}"
-    )
-    print(
-        f"    Output Relevancy distribution: "
-        f"{_format_distribution(micro['distributions']['output_relevancy_score'])}"
-    )
-    print(
-        f"    Completeness distribution:     "
-        f"{_format_distribution(micro['distributions']['completeness_score'])}"
-    )
-    if micro["counts"]["correctness_score"] > 0:
-        print(
-            f"    Correctness distribution:      "
-            f"{_format_distribution(micro['distributions']['correctness_score'])}"
+    micro_metric_parts: list[str] = []
+    macro_metric_parts: list[str] = []
+    for metric_key in active_metrics:
+        micro_avg, micro_std = micro[metric_key]
+        macro_avg, macro_std = macro[metric_key]
+        micro_count = micro["counts"][f"{metric_key}_score"]
+        macro_count = macro["counts"][f"{metric_key}_score"]
+        label = METRIC_LABELS[metric_key]
+        micro_metric_parts.append(
+            f"{label}={micro_avg:.3f} (+/-{micro_std:.3f}) [n={micro_count}]"
+            if micro_count > 0
+            else f"{label}=N/A"
         )
-    print(
-        f"  {'OVERALL (macro)':20} Output Relevancy={macro_rel_avg:.3f} (+/-{macro_rel_std:.3f})  "
-        f"Completeness={macro_comp_avg:.3f} (+/-{macro_comp_std:.3f})"
-        f"{macro_correctness_text}  n_routes={macro['n_routes']}"
-    )
+        macro_metric_parts.append(
+            f"{label}={macro_avg:.3f} (+/-{macro_std:.3f}) [n={macro_count}]"
+            if macro_count > 0
+            else f"{label}=N/A"
+        )
+
+    print(f"  {'OVERALL (micro)':20} {'  '.join(micro_metric_parts)}  n={micro['n']}")
+    for metric_key in active_metrics:
+        score_field = f"{metric_key}_score"
+        if micro["counts"][score_field] > 0:
+            print(
+                f"    {METRIC_LABELS[metric_key] + ' distribution:':<30} "
+                f"{_format_distribution(micro['distributions'][score_field])}"
+            )
+    print(f"  {'OVERALL (macro)':20} {'  '.join(macro_metric_parts)}  n_routes={macro['n_routes']}")
 
 
 def maybe_write_outputs(
@@ -488,6 +544,7 @@ def maybe_write_outputs(
                 "name": summary["name"],
                 "rows": summary["rows"],
                 "ok_rows": summary["ok_rows"],
+                "active_metrics": summary.get("active_metrics", ALL_METRIC_NAMES),
                 "status_counts": summary["status_counts"],
                 "route_counts": summary["route_counts"],
                 "score_stats": _stats_to_jsonable(summary["score_stats"]),
@@ -516,6 +573,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--input",
         default=str(default_input) if default_input else None,
         help="Path to an enriched eval CSV/JSONL file, or a directory containing enriched files.",
+    )
+    parser.add_argument(
+        "--metrics",
+        "--metric",
+        nargs="+",
+        default=None,
+        choices=ALL_METRIC_NAMES,
+        metavar="METRIC",
+        help=(
+            "Subset of metrics to aggregate (default: infer from populated score columns). "
+            f"Choices: {', '.join(ALL_METRIC_NAMES)}."
+        ),
     )
     parser.add_argument(
         "--route-column",
@@ -576,7 +645,12 @@ def main() -> None:
     }
 
     summaries = {
-        subset_name: summarize_subset(subset_name, subset_df, route_column)
+        subset_name: summarize_subset(
+            subset_name,
+            subset_df,
+            route_column,
+            metrics=args.metrics,
+        )
         for subset_name, subset_df in subsets.items()
     }
 
