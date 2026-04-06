@@ -17,3 +17,4 @@ pydantic==2.12.5
 pytest
 python-dotenv==1.2.1
 tqdm==4.67.1
+uplink==0.10.0
