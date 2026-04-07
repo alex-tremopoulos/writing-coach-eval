@@ -376,7 +376,7 @@ def build_summary_csv_rows(
                 "n_no_response": None,
                 "n_scored": rs.get("n"),
                 **_llm_metric_fields(rs, rs.get("counts")),
-                **_empty_distribution_fields(),
+                **_distribution_fields(rs.get("distributions", {})),
                 **_empty_metric_fields("heuristic", _HEURISTIC_STAT_FIELDS),
             }
             rows.append(row)

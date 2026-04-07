@@ -144,6 +144,11 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
             "output_relevancy": _avg_std(bucket["output_relevancy_score"]),
             "completeness": _avg_std(bucket["completeness_score"]),
             "correctness": _avg_std(bucket["correctness_score"]),
+            "distributions": {
+                "output_relevancy_score": _score_distribution(bucket["output_relevancy_score"]),
+                "completeness_score": _score_distribution(bucket["completeness_score"]),
+                "correctness_score": _score_distribution(bucket["correctness_score"]),
+            },
         }
         for route, bucket in route_buckets.items()
     }
@@ -482,6 +487,14 @@ def print_subset_summary(summary: dict[str, Any]) -> None:
                 else f"{label}=N/A"
             )
         print(f"  {route:20} {'  '.join(metric_parts)}  n={route_stats['n']}")
+        route_distributions = route_stats.get("distributions", {})
+        for metric_key in active_metrics:
+            score_field = f"{metric_key}_score"
+            if route_stats["counts"][score_field] > 0 and score_field in route_distributions:
+                print(
+                    f"    {METRIC_LABELS[metric_key] + ' dist:':<30} "
+                    f"{_format_distribution(route_distributions[score_field])}"
+                )
 
     micro = stats["micro"]
     macro = stats["macro"]

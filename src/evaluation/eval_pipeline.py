@@ -562,6 +562,7 @@ def _compute_score_stats(ok_results: list[dict[str, Any]]) -> dict[str, Any]:
             "n": b["row_count"],
             "counts": {field: len(b[field]) for field in SCORE_FIELD_LABELS},
             **{mk: _avg_std(b[f"{mk}_score"]) for mk in METRIC_KEYS},
+            "distributions": {f"{mk}_score": _score_distribution(b[f"{mk}_score"]) for mk in METRIC_KEYS},
         }
         for route, b in route_buckets.items()
     }
@@ -1453,6 +1454,11 @@ def _print_summary(
         for route in sorted(stats["per_route"]):
             s = stats["per_route"][route]
             print(_format_score_line(route, s, f"  n={s['n']}"))
+            for mk in METRIC_KEYS:
+                sf = f"{mk}_score"
+                if s["counts"][sf] > 0:
+                    label = SCORE_FIELD_LABELS[sf]
+                    print(f"    {label + ' dist:':<32} {_format_distribution(s['distributions'][sf])}")
 
         print()
         micro, macro = stats["micro"], stats["macro"]
