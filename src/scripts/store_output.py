@@ -16,6 +16,7 @@ Output:
 
 import csv
 import json
+import os
 import sys
 import time
 import types
@@ -23,6 +24,17 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
 from collections import Counter
+
+# Allow running from the eval workspace against the Writing Coach app codebase.
+# Set WC_APP_SRC to the root of the Writing Coach repo before running, e.g.:
+#   $env:WC_APP_SRC = "C:\path\to\writing-coach-app"
+# THIS HAS TO CHANGE TO YOUR LOCAL PATH
+# It currently works fro Writing Coach v2. If used for v3, code needs to be updated.
+_WC_APP_SRC = os.getenv("WC_APP_SRC")
+if _WC_APP_SRC:
+    _wc_root = str(Path(_WC_APP_SRC).resolve())
+    if _wc_root not in sys.path:
+        sys.path.insert(0, _wc_root)
 
 from src.graph_presets import get_preset, register_preset
 from src.presets_config import PRESET_CONFIGS, get_preset_config
@@ -333,7 +345,7 @@ def process_csv(
                       (case-insensitive). Pass None to process all rows.
     """
     output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     # Fixed filenames based on input stem so resume works across restarts
     # Allow caller to override output paths (e.g. to append into an existing file)
@@ -489,6 +501,12 @@ def process_csv(
     print(f"\nOutputs saved:")
     print(f"  Summary : {results_csv}")
     print(f"  Details : {details_jsonl}")
+
+    for _log_file in ["llm_outputs.txt", "llm_prompts.txt"]:
+        _log_path = Path(_log_file)
+        if _log_path.exists():
+            _log_path.unlink()
+            print(f"  Deleted : {_log_file}")
 
 
 if __name__ == "__main__":
