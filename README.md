@@ -66,7 +66,7 @@ The rubric-generation strategy combines four sources of context:
 
 - The user command
 - The original input text
-- Route-specific behavior guidance from `src/constants/route_prompts.py`
+- Route-specific behavior guidance from `src/constants/route_prompts_v3.py`
 - Shared evaluation dimensions from `src/constants/metrics_definitions.py`
 
 Current metrics are deliberately narrow: the generated rubrics focus mainly on output relevancy and completeness. This keeps scoring aligned to the user request and route behavior rather than drifting into unrelated quality dimensions.
