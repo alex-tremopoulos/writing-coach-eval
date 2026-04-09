@@ -23,9 +23,8 @@ Route to RESEARCH if:
 - User says "tell me more" or asks for more information about a topic (even with prior research in history — this requests DEEPER literature search, not a summary)
 - User asks about strength, validity, or defensibility of claims
 - User's question would be meaningfully improved by citing actual papers
-- Message combines research + editing ("find papers and add citations") → RESEARCH first
-- Imperative command naming a research topic ("write about gut microbiome") → RESEARCH
-- Affirmative after topic introduction ("yes", "go ahead", "sounds good") with unresearched topic in history → RESEARCH (inherit topic from history)
+- Message combines research + editing ("find papers and add citations")
+- Imperative command naming a research topic ("write about gut microbiome")
 
 Intent mapping:
 - validate_claims: check/verify claims.
@@ -42,9 +41,9 @@ Use RESPOND for:
 - Questions about the assistant's capabilities
 - Follow-up about previously found papers that doesn't need new search
 
-- Selected text that is an HTML table, markdown pipe table, or LaTeX tabular → always RESPOND (merge system cannot splice tables).
+- Selected text that is an HTML table, markdown pipe table, or LaTeX tabular (merge system cannot splice tables).
 - Requests to evade plagiarism detection, fabricate citations, disguise copied text, or write assignments for submission → always RESPOND with refusal.
-- Unbounded requests ("fix everything", "make it perfect", "write the whole paper") → always RESPOND.
+- Unbounded requests ("fix everything", "make it perfect", "write the whole paper").
 
 
 """,
@@ -74,6 +73,8 @@ Edit text with new research (strengthen argument, add evidence, improve with cit
 """,
 
     "UNIVERSAL": """\
+# "Prior research" means actual paper search results in conversation history — citation IDs like [C1-1-1], paper titles, DOIs, or structured paper lists. General advice, writing tips, or discussion from the assistant do NOT count as prior research.
+
 # Is the document empty (0 chars)?
 - Empty doc + clear research topic (in message or history) → RESEARCH / explore_literature
 - Empty doc + revision command with no topic → RESPOND
