@@ -96,7 +96,33 @@ SCORE_FIELD_LABELS = {
 METRIC_KEYS = ("output_relevancy", "completeness", "correctness")
 
 # Canonical metric names accepted by the --metrics CLI argument
-ALL_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
+SCORING_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
+
+
+def _run_harmfulness_scan(*args, **kwargs):
+    from src.evaluation.giskard_scans.scan_harmfulness import run_harmfulness_scan
+
+    return run_harmfulness_scan(*args, **kwargs)
+
+
+def _run_stereotypes_scan(*args, **kwargs):
+    from src.evaluation.giskard_scans.scan_stereotypes import run_stereotypes_scan
+
+    return run_stereotypes_scan(*args, **kwargs)
+
+
+def _run_jailbreak_scan(*args, **kwargs):
+    from src.evaluation.giskard_scans.scan_jailbreak import run_jailbreak_scan
+
+    return run_jailbreak_scan(*args, **kwargs)
+
+
+SCAN_METRIC_RUNNERS = {
+    "potential_harm": _run_harmfulness_scan,
+    "toxicity": _run_stereotypes_scan,
+    "resilience": _run_jailbreak_scan,
+}
+ALL_METRIC_NAMES: list[str] = [*SCORING_METRIC_NAMES, *SCAN_METRIC_RUNNERS.keys()]
 
 NON_RESPONSE_STATUS = "NO_RESPONSE"
 
@@ -523,6 +549,44 @@ def _required_score_fields(
     return required
 
 
+def _split_selected_metrics(metrics: list[str] | None) -> tuple[list[str] | None, list[str]]:
+    """Split selected metrics into row-scoring metrics and dataset-level scan metrics.
+
+    Returns (scoring_metrics, scan_metrics). When ``metrics`` is None, scoring metrics are
+    treated as default/all and scans are disabled.
+    """
+    if metrics is None:
+        return None, []
+
+    normalized = [m.lower().replace(" ", "_") for m in metrics]
+    scoring = [m for m in normalized if m in SCORING_METRIC_NAMES]
+    scans = [m for m in normalized if m in SCAN_METRIC_RUNNERS]
+    return scoring, scans
+
+
+def _run_selected_scan_metrics(
+    scan_metrics: list[str],
+    input_path: str,
+    output_dir: str,
+) -> None:
+    """Run selected dataset-level Giskard scans and persist reports under output_dir."""
+    for metric_name in scan_metrics:
+        runner = SCAN_METRIC_RUNNERS[metric_name]
+        metric_output_dir = Path(output_dir) / metric_name
+        logger.info(
+            "Running scan metric '%s' using dataset seed '%s' (output: %s)",
+            metric_name,
+            input_path,
+            metric_output_dir,
+        )
+        runner(
+            dataset_csv=input_path,
+            persist_output=True,
+            output_dir=str(metric_output_dir),
+        )
+        logger.info("Completed scan metric '%s'", metric_name)
+
+
 def _avg_std(scores: list) -> tuple[float, float]:
     """Return (mean, stdev) of scores, or (nan, 0.0) for an empty list."""
     if not scores:
@@ -828,7 +892,7 @@ async def process_row(
     """Run Stage 1 (generate rubrics) and Stage 2 (judge) for one row.
 
     When *metrics* is provided, only the specified metrics are evaluated.
-    Accepted values: 'completeness', 'output_relevancy', 'correctness'.
+    Accepted row-level values: 'completeness', 'output_relevancy', 'correctness'.
     """
     row_id = row["row_id"]
     result = {
@@ -1193,8 +1257,9 @@ async def run_pipeline(
 ) -> None:
     """Run the full dynamic rubrics evaluation pipeline.
 
-    When *metrics* is provided, only the specified subset of metrics is evaluated.
-    Accepted values: 'completeness', 'output_relevancy', 'correctness'.
+    When *metrics* is provided, only the selected subset is executed.
+    Row-level metrics: 'completeness', 'output_relevancy', 'correctness'.
+    Dataset-level scan metrics: 'potential_harm', 'toxicity', 'resilience'.
     """
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1212,8 +1277,26 @@ async def run_pipeline(
     logger.info("Rubrics mode: %s", rubrics_mode)
     logger.info("Route column: %s", route_column)
     logger.info("Data origin:  %s", data_origin)
-    logger.info("Metrics:      %s", metrics if metrics is not None else "all")
+    logger.info("Metrics:      %s", metrics if metrics is not None else "all row-level")
     logger.info("=" * 80)
+
+    scoring_metrics, scan_metrics = _split_selected_metrics(metrics)
+    logger.info(
+        "Selected row-level metrics: %s",
+        scoring_metrics if scoring_metrics is not None else "all",
+    )
+    logger.info("Selected scan metrics: %s", scan_metrics if scan_metrics else "none")
+
+    if scan_metrics:
+        _run_selected_scan_metrics(
+            scan_metrics=scan_metrics,
+            input_path=input_path,
+            output_dir=output_dir,
+        )
+
+    if metrics is not None and not scoring_metrics:
+        logger.info("No row-level metrics selected; completed scan-only run.")
+        return
 
     # Load data
     rows = load_input_data(input_path, routes=routes, limit=limit, route_column=route_column, data_origin=data_origin)
@@ -1249,7 +1332,7 @@ async def run_pipeline(
         result = await process_row(
             row, deployment, temperature, max_tokens, semaphore,
             rubrics_mode=rubrics_mode,
-            metrics=metrics,
+            metrics=scoring_metrics,
         )
         await writer.write_result(result)
         return result
@@ -1755,7 +1838,9 @@ def main():
         help=(
             f"Subset of metrics to evaluate (default: all). "
             f"Choices: {', '.join(ALL_METRIC_NAMES)}. "
-            "Example: --metrics completeness output_relevancy"
+            "Row-level metrics write per-row scores; scan metrics (potential_harm, toxicity, resilience) "
+            "run Giskard scans and save report artifacts under --output-dir. "
+            "Example: --metrics completeness output_relevancy potential_harm"
         ),
     )
 

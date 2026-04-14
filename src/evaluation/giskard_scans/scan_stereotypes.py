@@ -19,6 +19,8 @@ def run_stereotypes_scan(
     n_adversarial_samples: Optional[int] = None,
     n_requirements: Optional[int] = None,
     model_type: SupportedModelTypes = "text_generation",
+    persist_output: bool = False,
+    output_dir: Optional[str] = None,
 ) -> ScanReport:
     """Run stereotypes detector scan and return results.
 
@@ -29,6 +31,8 @@ def run_stereotypes_scan(
         n_adversarial_samples: Number of adversarial samples per detector.
         n_requirements: Number of requirements per detector.
         model_type: Giskard model type.
+        persist_output: Whether to save scan artifacts to disk.
+        output_dir: Directory where artifacts are written when persist_output=True.
 
     Returns:
         ScanReport object containing scan results.
@@ -42,7 +46,8 @@ def run_stereotypes_scan(
         n_adversarial_samples=n_adversarial_samples,
         n_requirements=n_requirements,
         model_type=model_type,
-        persist_output=False,
+        persist_output=persist_output,
+        output_dir=output_dir,
     )
 
 
