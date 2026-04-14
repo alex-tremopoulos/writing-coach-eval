@@ -32,6 +32,7 @@ DEFAULT_INPUT_BASE = ROOT / "data_outputs" / "round4"
 OUTPUT_DIR = ROOT / "final_data"
 REF_CSV = ROOT / "data" / "data_routes_expanded.csv"
 GOLD_STANDARD = ROOT / "final_data" / "all_results.csv"
+DOMAINS_CSV = ROOT / "final_data" / "all_results_v2_domains.csv"
 
 DEFAULT_SOURCE_FOLDERS = [
     "extra10",
@@ -59,6 +60,30 @@ FOLDER_DATASET_SOURCE: dict[str, str] = {
 # extra respond cases added after the original dataset; they don't exist in
 # data_routes_expanded.csv.
 EXTRA_RESPOND_PREV_IDS = set(range(1, 10))  # prev_id 1–9
+
+# Rows that accept two routes: if route_orch is one of the listed values,
+# route_intended is set to match route_orch (both are considered correct).
+# Applied after the gold-standard lookup.
+DUAL_ACCEPTABLE_ROUTES: dict[tuple[int, str], frozenset] = {
+    (110, "respond_only"):        frozenset({"RESPOND", "RESEARCH"}),
+    (111, "respond_only"):        frozenset({"RESPOND", "RESEARCH"}),
+    (31,  "revise_research_only"): frozenset({"REVISE_SIMPLE", "REVISE_RESEARCH"}),
+    (132, "revise_research_only"): frozenset({"REVISE_SIMPLE", "REVISE_RESEARCH"}),
+    (133, "revise_research_only"): frozenset({"REVISE_SIMPLE", "REVISE_RESEARCH"}),
+    (15,  "extra167kiwi"):         frozenset({"REVISE_SIMPLE", "REVISE_RESEARCH"}),
+    (60,  "extra167kiwi"):         frozenset({"REVISE_SIMPLE", "REVISE_RESEARCH"}),
+    (62,  "extra167kiwi"):         frozenset({"REVISE_SIMPLE", "REVISE_RESEARCH"}),
+}
+
+# Hard manual overrides: these take the highest priority, overriding the gold
+# standard and dual-acceptable logic.  The route_intended is always set to the
+# specified value regardless of what the gold standard or route_orch says.
+MANUAL_OVERRIDES: dict[tuple[int, str], str] = {
+    (141, "respond_only"): "RESPOND",
+    (30,  "extra167kiwi"): "RESPOND",
+    (31,  "extra167kiwi"): "RESPOND",
+    (63,  "extra167kiwi"): "RESPOND",
+}
 
 # Columns bundled into the nested 'output' field
 OUTPUT_FIELDS = [
@@ -114,13 +139,26 @@ def compute_intended_route(
     row: pd.Series,
     gold_mapping: dict[tuple[int, str], str],
 ) -> str:
-    """Return the intended route from gold standard, falling back to route_orch.
+    """Return the intended route, applying overrides in priority order:
 
-    ERROR rows always keep route_intended == route_orch == 'ERROR'.
+    1. MANUAL_OVERRIDES — hard-coded corrections, always win.
+    2. DUAL_ACCEPTABLE_ROUTES — if route_orch is one of the two acceptable
+       values for this row, set route_intended = route_orch so they match.
+    3. Gold-standard mapping keyed by (row_id_previous_folder, folder_source).
+    4. Fallback: route_orch itself (for rows absent from the gold standard).
     """
-    if str(row["route_orch"]).upper() == "ERROR":
-        return "ERROR"
     key = (int(row["row_id_previous_folder"]), str(row["folder_source"]))
+
+    # 1. Hard manual overrides
+    if key in MANUAL_OVERRIDES:
+        return MANUAL_OVERRIDES[key]
+
+    # 2. Dual-acceptable routes
+    acceptable = DUAL_ACCEPTABLE_ROUTES.get(key)
+    if acceptable and str(row["route_orch"]) in acceptable:
+        return str(row["route_orch"])
+
+    # 3. Gold standard, 4. fallback
     return gold_mapping.get(key, row["route_orch"])
 
 
@@ -288,6 +326,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--domains-csv",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a CSV containing query_domain and input_domain columns, "
+            "joined by (row_id_previous_folder, folder_source). "
+            f"Default: {DOMAINS_CSV.relative_to(ROOT)}"
+        ),
+    )
+    parser.add_argument(
         "--append",
         action="store_true",
         help="Append to existing output CSV/JSONL files instead of overwriting them.",
@@ -308,6 +356,9 @@ def main() -> None:
     ref_csv_path = Path(args.ref_csv) if args.ref_csv else REF_CSV
     if not ref_csv_path.is_absolute():
         ref_csv_path = ROOT / ref_csv_path
+    domains_csv_path = Path(args.domains_csv) if args.domains_csv else DOMAINS_CSV
+    if not domains_csv_path.is_absolute():
+        domains_csv_path = ROOT / domains_csv_path
 
     date_suffix = date.today().strftime("%m%d")
 
@@ -318,6 +369,7 @@ def main() -> None:
     print(f"  input-base     : {input_base}")
     print(f"  gold-standard  : {gold_standard_path}")
     print(f"  ref-csv        : {ref_csv_path}")
+    print(f"  domains-csv    : {domains_csv_path}")
     print(f"  append         : {args.append}")
     print(f"  date suffix    : {date_suffix}")
     print("=" * 60)
@@ -394,20 +446,39 @@ def main() -> None:
                   f"folder={r['folder_source']}, "
                   f"query={str(r['query'])[:60]}")
 
-    # ---- 7. Build 'output' column -------------------------------------------
+    # ---- 7. Join query_domain and input_domain from domains CSV --------------
+    if domains_csv_path.exists():
+        domains_df = pd.read_csv(
+            domains_csv_path,
+            usecols=["row_id_previous_folder", "folder_source", "query_domain", "input_domain"],
+        )
+        combined = combined.merge(domains_df, on=["row_id_previous_folder", "folder_source"], how="left")
+        matched = combined["query_domain"].notna().sum()
+        print(f"\n  domain columns joined: {matched} / {len(combined)} rows matched")
+        if matched < len(combined):
+            print("  [WARN] Some rows have no domain data — query_domain/input_domain will be NaN.")
+    else:
+        print(f"\n[WARN] domains CSV not found at {domains_csv_path}. "
+              "query_domain and input_domain will be absent.")
+        combined["query_domain"] = None
+        combined["input_domain"] = None
+
+    # ---- 8. Build 'output' column -------------------------------------------
     combined["output"] = combined.apply(
         lambda row: json.dumps(build_output_dict(row), ensure_ascii=False),
         axis=1,
     )
 
-    # ---- 8. Select and order final columns ----------------------------------
+    # ---- 9. Select and order final columns ----------------------------------
     keep_cols = [
         "row_id_previous_folder",
         "folder_source",
         "dataset_source",
         "query",
+        "query_domain",
         "input_preview",
         "input",
+        "input_domain",
         "route_orch",
         "route_intended",
         "output",
@@ -425,6 +496,7 @@ def main() -> None:
 
     # New 1-based row_id
     csv_path = OUTPUT_DIR / f"all_results_{date_suffix}.csv"
+    # (step numbering follows the added join step above)
     start_id = 1
     if args.append and csv_path.exists():
         try:
@@ -435,14 +507,14 @@ def main() -> None:
     final.insert(0, "row_id", range(start_id, start_id + len(final)))
     final.reset_index(drop=True, inplace=True)
 
-    # ---- 9. Write CSV -------------------------------------------------------
+    # ---- 10. Write CSV ------------------------------------------------------
     print("\n" + "=" * 60)
     print("Writing combined output …")
     print("=" * 60)
 
     write_csv(final, csv_path, append=args.append)
 
-    # ---- 10. Write JSONL (output field as nested dict, not string) ----------
+    # ---- 11. Write JSONL (output field as nested dict, not string) ----------
     jsonl_path = OUTPUT_DIR / f"all_results_{date_suffix}.jsonl"
     records = []
     for _, row in final.iterrows():
@@ -451,7 +523,7 @@ def main() -> None:
         records.append(rec)
     write_jsonl(records, jsonl_path, append=args.append)
 
-    # ---- 11. Summary --------------------------------------------------------
+    # ---- 12. Summary --------------------------------------------------------
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
