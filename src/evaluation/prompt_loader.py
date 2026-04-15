@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Tuple
 
 from src.constants.metrics_definitions import CORRECTNESS_METRIC_NAME, METRICS_DEFINITION
-from src.constants.route_prompts import ROUTE_PROMPTS
+from src.constants.route_prompts_v3 import ROUTE_PROMPTS
 
 # src/prompts/ — one level above src/evaluation/
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
@@ -141,7 +141,7 @@ def load_combined_prompt(filename: str) -> Tuple[str, str]:
 def load_route_prompt(route: str) -> str:
     """Return the orchestrator prompt section for a specific route.
 
-    Loaded from the ``ROUTE_PROMPTS`` dict in ``src/constants/route_prompts.py``.
+    Loaded from the ``ROUTE_PROMPTS`` dict in ``src/constants/route_prompts_v3.py``.
     If present, the shared ``UNIVERSAL`` block is prepended to the route-specific
     block so the generator sees both general routing guidance and route details.
 
