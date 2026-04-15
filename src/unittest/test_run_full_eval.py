@@ -3,18 +3,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from .. import run_full_eval
+from src.evaluation.giskard_orchestrator import split_selected_metrics
+from src.orchestration.eval_steps import step_giskard_scans
 
 
 class TestSelectedMetricsSplit(unittest.TestCase):
 
     def test_none_defaults_to_scoring_pipeline_only(self):
-        scoring, scans = run_full_eval._split_selected_metrics(None)
+        scoring, scans = split_selected_metrics(None)
         self.assertIsNone(scoring)
         self.assertEqual(scans, [])
 
     def test_mixed_metrics_are_normalized_and_partitioned(self):
-        scoring, scans = run_full_eval._split_selected_metrics(
+        scoring, scans = split_selected_metrics(
             ["Completeness", "potential harm", "correctness", "resilience", "correctness"]
         )
         self.assertEqual(scoring, ["completeness", "correctness"])
@@ -24,6 +25,8 @@ class TestSelectedMetricsSplit(unittest.TestCase):
 class TestGiskardScanStep(unittest.TestCase):
 
     def test_step_giskard_scans_uses_metric_specific_output_dirs(self):
+        from src.evaluation.giskard_orchestrator import SCAN_METRIC_RUNNERS
+
         calls: list[tuple[str, dict]] = []
 
         def make_runner(name: str):
@@ -34,7 +37,7 @@ class TestGiskardScanStep(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
             with patch.dict(
-                run_full_eval.SCAN_METRIC_RUNNERS,
+                SCAN_METRIC_RUNNERS,
                 {
                     "potential_harm": make_runner("potential_harm"),
                     "toxicity": make_runner("toxicity"),
@@ -42,7 +45,7 @@ class TestGiskardScanStep(unittest.TestCase):
                 },
                 clear=True,
             ):
-                run_full_eval.step_giskard_scans(
+                step_giskard_scans(
                     input_path="final_data/all_results.csv",
                     output_dir=output_dir,
                     scan_metrics=["potential_harm", "toxicity"],
