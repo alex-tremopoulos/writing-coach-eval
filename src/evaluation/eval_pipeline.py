@@ -568,6 +568,10 @@ def _run_selected_scan_metrics(
     scan_metrics: list[str],
     input_path: str,
     output_dir: str,
+    n_samples: int = 20,
+    seed: int = 42,
+    n_adversarial_samples: int = 5,
+    n_requirements: int = 4,
 ) -> None:
     """Run selected dataset-level Giskard scans and persist reports under output_dir."""
     for metric_name in scan_metrics:
@@ -581,6 +585,10 @@ def _run_selected_scan_metrics(
         )
         runner(
             dataset_csv=input_path,
+            n_samples=n_samples,
+            seed=seed,
+            n_adversarial_samples=n_adversarial_samples,
+            n_requirements=n_requirements,
             persist_output=True,
             output_dir=str(metric_output_dir),
         )
@@ -1254,6 +1262,10 @@ async def run_pipeline(
     save_local: bool = False,
     data_origin: str = "all",
     metrics: list[str] | None = None,
+    n_samples: int = 20,
+    seed: int = 42,
+    n_adversarial_samples: int = 5,
+    n_requirements: int = 4,
 ) -> None:
     """Run the full dynamic rubrics evaluation pipeline.
 
@@ -1292,6 +1304,10 @@ async def run_pipeline(
             scan_metrics=scan_metrics,
             input_path=input_path,
             output_dir=output_dir,
+            n_samples=n_samples,
+            seed=seed,
+            n_adversarial_samples=n_adversarial_samples,
+            n_requirements=n_requirements,
         )
 
     if metrics is not None and not scoring_metrics:
@@ -1843,6 +1859,30 @@ def main():
             "Example: --metrics completeness output_relevancy potential_harm"
         ),
     )
+    parser.add_argument(
+        "--n-samples",
+        type=int,
+        default=20,
+        help="Number of samples from input dataset to use as seed for Giskard scans (default: 20)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling and scan generation (default: 42)",
+    )
+    parser.add_argument(
+        "--n-adversarial-samples",
+        type=int,
+        default=5,
+        help="Number of adversarial samples per detector in Giskard scans (default: 5)",
+    )
+    parser.add_argument(
+        "--n-requirements",
+        type=int,
+        default=4,
+        help="Number of requirements per detector in Giskard scans (default: 4)",
+    )
 
     args = parser.parse_args()
 
@@ -1863,6 +1903,10 @@ def main():
             save_local=args.save_local,
             data_origin=args.data_origin,
             metrics=args.metrics,
+            n_samples=args.n_samples,
+            seed=args.seed,
+            n_adversarial_samples=args.n_adversarial_samples,
+            n_requirements=args.n_requirements,
         )
     )
 
