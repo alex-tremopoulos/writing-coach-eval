@@ -98,32 +98,6 @@ METRIC_KEYS = ("output_relevancy", "completeness", "correctness")
 # Canonical metric names accepted by the --metrics CLI argument
 SCORING_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
 
-
-def _run_harmfulness_scan(*args, **kwargs):
-    from src.evaluation.giskard_scans.scan_harmfulness import run_harmfulness_scan
-
-    return run_harmfulness_scan(*args, **kwargs)
-
-
-def _run_stereotypes_scan(*args, **kwargs):
-    from src.evaluation.giskard_scans.scan_stereotypes import run_stereotypes_scan
-
-    return run_stereotypes_scan(*args, **kwargs)
-
-
-def _run_jailbreak_scan(*args, **kwargs):
-    from src.evaluation.giskard_scans.scan_jailbreak import run_jailbreak_scan
-
-    return run_jailbreak_scan(*args, **kwargs)
-
-
-SCAN_METRIC_RUNNERS = {
-    "potential_harm": _run_harmfulness_scan,
-    "toxicity": _run_stereotypes_scan,
-    "resilience": _run_jailbreak_scan,
-}
-ALL_METRIC_NAMES: list[str] = [*SCORING_METRIC_NAMES, *SCAN_METRIC_RUNNERS.keys()]
-
 NON_RESPONSE_STATUS = "NO_RESPONSE"
 
 REMOVAL_REQUEST_RE = re.compile(
@@ -547,52 +521,6 @@ def _required_score_fields(
     if include_correctness:
         required.append("correctness_score")
     return required
-
-
-def _split_selected_metrics(metrics: list[str] | None) -> tuple[list[str] | None, list[str]]:
-    """Split selected metrics into row-scoring metrics and dataset-level scan metrics.
-
-    Returns (scoring_metrics, scan_metrics). When ``metrics`` is None, scoring metrics are
-    treated as default/all and scans are disabled.
-    """
-    if metrics is None:
-        return None, []
-
-    normalized = [m.lower().replace(" ", "_") for m in metrics]
-    scoring = [m for m in normalized if m in SCORING_METRIC_NAMES]
-    scans = [m for m in normalized if m in SCAN_METRIC_RUNNERS]
-    return scoring, scans
-
-
-def _run_selected_scan_metrics(
-    scan_metrics: list[str],
-    input_path: str,
-    output_dir: str,
-    n_samples: int = 20,
-    seed: int = 42,
-    n_adversarial_samples: int = 5,
-    n_requirements: int = 4,
-) -> None:
-    """Run selected dataset-level Giskard scans and persist reports under output_dir."""
-    for metric_name in scan_metrics:
-        runner = SCAN_METRIC_RUNNERS[metric_name]
-        metric_output_dir = Path(output_dir) / metric_name
-        logger.info(
-            "Running scan metric '%s' using dataset seed '%s' (output: %s)",
-            metric_name,
-            input_path,
-            metric_output_dir,
-        )
-        runner(
-            dataset_csv=input_path,
-            n_samples=n_samples,
-            seed=seed,
-            n_adversarial_samples=n_adversarial_samples,
-            n_requirements=n_requirements,
-            persist_output=True,
-            output_dir=str(metric_output_dir),
-        )
-        logger.info("Completed scan metric '%s'", metric_name)
 
 
 def _avg_std(scores: list) -> tuple[float, float]:
@@ -1262,16 +1190,11 @@ async def run_pipeline(
     save_local: bool = False,
     data_origin: str = "all",
     metrics: list[str] | None = None,
-    n_samples: int = 20,
-    seed: int = 42,
-    n_adversarial_samples: int = 5,
-    n_requirements: int = 4,
 ) -> None:
     """Run the full dynamic rubrics evaluation pipeline.
 
-    When *metrics* is provided, only the selected subset is executed.
-    Row-level metrics: 'completeness', 'output_relevancy', 'correctness'.
-    Dataset-level scan metrics: 'potential_harm', 'toxicity', 'resilience'.
+    When *metrics* is provided, only the selected row-level subset is executed.
+    Supported values: 'completeness', 'output_relevancy', 'correctness'.
     """
     if run_name is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1289,30 +1212,8 @@ async def run_pipeline(
     logger.info("Rubrics mode: %s", rubrics_mode)
     logger.info("Route column: %s", route_column)
     logger.info("Data origin:  %s", data_origin)
-    logger.info("Metrics:      %s", metrics if metrics is not None else "all row-level")
+    logger.info("Metrics:      %s", metrics if metrics is not None else "all")
     logger.info("=" * 80)
-
-    scoring_metrics, scan_metrics = _split_selected_metrics(metrics)
-    logger.info(
-        "Selected row-level metrics: %s",
-        scoring_metrics if scoring_metrics is not None else "all",
-    )
-    logger.info("Selected scan metrics: %s", scan_metrics if scan_metrics else "none")
-
-    if scan_metrics:
-        _run_selected_scan_metrics(
-            scan_metrics=scan_metrics,
-            input_path=input_path,
-            output_dir=output_dir,
-            n_samples=n_samples,
-            seed=seed,
-            n_adversarial_samples=n_adversarial_samples,
-            n_requirements=n_requirements,
-        )
-
-    if metrics is not None and not scoring_metrics:
-        logger.info("No row-level metrics selected; completed scan-only run.")
-        return
 
     # Load data
     rows = load_input_data(input_path, routes=routes, limit=limit, route_column=route_column, data_origin=data_origin)
@@ -1348,7 +1249,7 @@ async def run_pipeline(
         result = await process_row(
             row, deployment, temperature, max_tokens, semaphore,
             rubrics_mode=rubrics_mode,
-            metrics=scoring_metrics,
+            metrics=metrics,
         )
         await writer.write_result(result)
         return result
@@ -1849,39 +1750,13 @@ def main():
         "--metric",
         nargs="+",
         default=None,
-        choices=ALL_METRIC_NAMES,
+        choices=SCORING_METRIC_NAMES,
         metavar="METRIC",
         help=(
             f"Subset of metrics to evaluate (default: all). "
-            f"Choices: {', '.join(ALL_METRIC_NAMES)}. "
-            "Row-level metrics write per-row scores; scan metrics (potential_harm, toxicity, resilience) "
-            "run Giskard scans and save report artifacts under --output-dir. "
-            "Example: --metrics completeness output_relevancy potential_harm"
+            f"Choices: {', '.join(SCORING_METRIC_NAMES)}. "
+            "Example: --metrics completeness output_relevancy"
         ),
-    )
-    parser.add_argument(
-        "--n-samples",
-        type=int,
-        default=20,
-        help="Number of samples from input dataset to use as seed for Giskard scans (default: 20)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for sampling and scan generation (default: 42)",
-    )
-    parser.add_argument(
-        "--n-adversarial-samples",
-        type=int,
-        default=5,
-        help="Number of adversarial samples per detector in Giskard scans (default: 5)",
-    )
-    parser.add_argument(
-        "--n-requirements",
-        type=int,
-        default=4,
-        help="Number of requirements per detector in Giskard scans (default: 4)",
     )
 
     args = parser.parse_args()
@@ -1903,10 +1778,6 @@ def main():
             save_local=args.save_local,
             data_origin=args.data_origin,
             metrics=args.metrics,
-            n_samples=args.n_samples,
-            seed=args.seed,
-            n_adversarial_samples=args.n_adversarial_samples,
-            n_requirements=args.n_requirements,
         )
     )
 

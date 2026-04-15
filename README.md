@@ -122,7 +122,7 @@ The older `reassign_data.py` uses hardcoded per-row exceptions and is kept for r
 
 ## Stage 2 — Run Evaluation: `run_full_eval.py`
 
-`src/run_full_eval.py` orchestrates the full evaluation pipeline end-to-end in five sequential steps.
+`src/run_full_eval.py` orchestrates the full evaluation pipeline end-to-end. It always runs the five row-level evaluation/reporting steps below, and can also run optional Giskard dataset-level scans in the same output folder when requested via `--metrics`.
 
 ```bash
 python -m src.run_full_eval
@@ -135,9 +135,21 @@ Key options:
 | `--input` | `final_data/all_results.csv` | Input CSV with system outputs |
 | `--route-column` | `intended` | `intended` or `orchestrator` |
 | `--routes` | (all) | Restrict to specific routes, e.g. `RESEARCH RESPOND` |
-| `--metrics` | (all) | Restrict to specific metrics: `completeness output_relevancy correctness` |
+| `--metrics` | (all row-level) | Restrict to specific metrics. Row-level: `completeness output_relevancy correctness`. Optional Giskard scans: `potential_harm toxicity resilience` |
 | `--run-name` | `eval_YYYYMMDD_HHMMSS` | Namespace for output files |
 | `--limit` | — | Max rows to process (useful for testing) |
+| `--n-samples` | `20` | Seed sample size for requested Giskard scans |
+| `--seed` | `42` | Random seed for Giskard sampling / adversarial generation |
+| `--n-adversarial-samples` | `5` | Adversarial samples per Giskard detector |
+| `--n-requirements` | `4` | Requirements generated per Giskard detector |
+
+Examples:
+
+```bash
+python -m src.run_full_eval --metrics completeness output_relevancy
+python -m src.run_full_eval --metrics potential_harm toxicity resilience
+python -m src.run_full_eval --metrics completeness correctness potential_harm
+```
 
 ### Output location
 
@@ -158,8 +170,13 @@ Key files produced:
 | `heuristic_scoring_all_natural_synthetic.txt` | Heuristic scoring summary |
 | `summary_scores.csv` | Flat summary keyed by `data_origin` × `scope` × `route` |
 | `metrics_score_combinations/item_level/reasoning_summaries.json` | LLM-generated pattern summaries per metric and score |
+| `{potential_harm|toxicity|resilience}/...` | Optional Giskard HTML/JSON/test-suite artifacts for requested scan metrics |
 
 ### Steps and scripts called internally
+
+#### Optional pre-step — Giskard dataset scans
+
+When `--metrics` includes any of `potential_harm`, `toxicity`, or `resilience`, `run_full_eval.py` first runs the matching detector-specific Giskard scan wrappers and writes the generated report artifacts into metric-specific subdirectories under the timestamped run folder. If only scan metrics are selected, the command exits after this stage.
 
 #### Step 1 — `src/evaluation/eval_pipeline.py`
 
@@ -170,7 +187,7 @@ Two-stage async LLM evaluation:
 
 Runs with a semaphore-limited concurrency, writes incrementally to CSV + JSONL for resume support. Produces the enriched CSV consumed by all downstream steps.
 
-Can be run standalone:
+Can be run standalone for row-level rubric scoring only:
 
 ```bash
 python -m src.evaluation.eval_pipeline \

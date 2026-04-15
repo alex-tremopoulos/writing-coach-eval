@@ -1,6 +1,7 @@
 """Run the full evaluation pipeline end-to-end.
 
 Orchestrates these scripts in order:
+  Optional: Giskard scans      — dataset-level safety / robustness scans
   1. eval_pipeline.py          — LLM rubrics evaluation
   2. split_natural_synthetic.py — split enriched results by data origin
   3. heuristic_scoring.py       — heuristic scoring for all / natural / synthetic
@@ -12,6 +13,7 @@ Usage:
   python -m src.run_full_eval --route-column orchestrator
   python -m src.run_full_eval --routes RESEARCH RESPOND --run-name my_experiment
   python -m src.run_full_eval --metrics completeness output_relevancy
+  python -m src.run_full_eval --metrics completeness potential_harm resilience
 """
 
 from __future__ import annotations
@@ -31,6 +33,35 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
+SCORING_METRIC_NAMES: list[str] = ["completeness", "output_relevancy", "correctness"]
+
+
+def _run_harmfulness_scan(*args, **kwargs):
+    from src.evaluation.giskard_scans.scan_harmfulness import run_harmfulness_scan
+
+    return run_harmfulness_scan(*args, **kwargs)
+
+
+def _run_stereotypes_scan(*args, **kwargs):
+    from src.evaluation.giskard_scans.scan_stereotypes import run_stereotypes_scan
+
+    return run_stereotypes_scan(*args, **kwargs)
+
+
+def _run_jailbreak_scan(*args, **kwargs):
+    from src.evaluation.giskard_scans.scan_jailbreak import run_jailbreak_scan
+
+    return run_jailbreak_scan(*args, **kwargs)
+
+
+SCAN_METRIC_RUNNERS = {
+    "potential_harm": _run_harmfulness_scan,
+    "toxicity": _run_stereotypes_scan,
+    "resilience": _run_jailbreak_scan,
+}
+ALL_METRIC_NAMES: list[str] = [*SCORING_METRIC_NAMES, *SCAN_METRIC_RUNNERS.keys()]
+
+
 def _timestamp() -> str:
     return datetime.now().strftime("%m%d_%H%M")
 
@@ -41,6 +72,22 @@ def _find_file_ending_with(directory: Path, suffix: str) -> Path:
     if not candidates:
         raise FileNotFoundError(f"No file ending with '{suffix}' found in {directory}")
     return max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
+
+
+def _split_selected_metrics(metrics: list[str] | None) -> tuple[list[str] | None, list[str]]:
+    """Split selected metrics into row-scoring metrics and Giskard scan metrics."""
+    if metrics is None:
+        return None, []
+
+    normalized: list[str] = []
+    for metric in metrics:
+        value = metric.lower().replace(" ", "_")
+        if value not in normalized:
+            normalized.append(value)
+
+    scoring = [metric for metric in normalized if metric in SCORING_METRIC_NAMES]
+    scans = [metric for metric in normalized if metric in SCAN_METRIC_RUNNERS]
+    return scoring, scans
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,12 +126,13 @@ def parse_args() -> argparse.Namespace:
         "--metric",
         nargs="+",
         default=None,
-        choices=["completeness", "output_relevancy", "correctness"],
+        choices=ALL_METRIC_NAMES,
         metavar="METRIC",
         help=(
             "Subset of metrics to evaluate (default: all). "
-            "Choices: completeness, output_relevancy, correctness. "
-            "Example: --metrics completeness output_relevancy"
+            "Row-level metrics: completeness, output_relevancy, correctness. "
+            "Giskard scan metrics: potential_harm, toxicity, resilience. "
+            "Example: --metrics completeness output_relevancy potential_harm"
         ),
     )
     parser.add_argument(
@@ -92,6 +140,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Max number of rows to process (for testing)",
+    )
+    parser.add_argument(
+        "--n-samples",
+        type=int,
+        default=20,
+        help="Number of input rows to sample as seed data for Giskard scans (default: 20)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for Giskard scan sampling and adversarial generation (default: 42)",
+    )
+    parser.add_argument(
+        "--n-adversarial-samples",
+        type=int,
+        default=5,
+        help="Number of adversarial samples per Giskard detector (default: 5)",
+    )
+    parser.add_argument(
+        "--n-requirements",
+        type=int,
+        default=4,
+        help="Number of generated requirements per Giskard detector (default: 4)",
     )
     return parser.parse_args()
 
@@ -110,7 +182,7 @@ def step_eval_pipeline(
     metrics: list[str] | None = None,
     limit: int | None = None,
 ) -> None:
-    """Step 1 — run the LLM rubrics evaluation pipeline."""
+    """Run the LLM rubrics evaluation pipeline."""
     import asyncio
     from src.evaluation.eval_pipeline import run_pipeline
 
@@ -126,6 +198,32 @@ def step_eval_pipeline(
             limit=limit,
         )
     )
+
+
+def step_giskard_scans(
+    input_path: str,
+    output_dir: Path,
+    scan_metrics: list[str],
+    n_samples: int = 20,
+    seed: int = 42,
+    n_adversarial_samples: int = 5,
+    n_requirements: int = 4,
+) -> None:
+    """Run the selected dataset-level Giskard scans."""
+    for metric_name in scan_metrics:
+        runner = SCAN_METRIC_RUNNERS[metric_name]
+        metric_output_dir = output_dir / metric_name
+        print(f"Running Giskard scan '{metric_name}' -> {metric_output_dir}")
+        runner(
+            dataset_csv=input_path,
+            n_samples=n_samples,
+            seed=seed,
+            n_adversarial_samples=n_adversarial_samples,
+            n_requirements=n_requirements,
+            persist_output=True,
+            output_dir=str(metric_output_dir),
+        )
+        print(f"Completed Giskard scan '{metric_name}'")
 
 
 def step_split_natural_synthetic(
@@ -221,7 +319,7 @@ def step_extract_reasoning(
     output_dir: Path,
     metrics: list[str] | None = None,
 ) -> None:
-    """Step 4 — extract per-metric/score reasoning."""
+    """Extract per-metric/score reasoning."""
     from src.evaluation.extract_reasoning_by_score import main as extract_main
 
     extract_main(input_csv=enriched_csv, output_dir=output_dir, metrics=metrics)
@@ -231,7 +329,7 @@ def step_summarize_reasoning(
     data_dir: Path,
     metrics: list[str] | None = None,
 ) -> None:
-    """Step 5 — LLM-summarise reasoning patterns."""
+    """LLM-summarise reasoning patterns."""
     from src.evaluation.summarize_reasoning import main as summarize_main
 
     summarize_main(data_dir=data_dir, metrics=metrics)
@@ -429,14 +527,46 @@ def write_summary_csv(output_path: Path, rows: list[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
+    scoring_metrics, scan_metrics = _split_selected_metrics(args.metrics)
+    should_run_scoring_pipeline = args.metrics is None or bool(scoring_metrics)
+    total_steps = (1 if scan_metrics else 0) + (5 if should_run_scoring_pipeline else 0)
 
     route_folder = "route_orch" if args.route_column == "orchestrator" else "route_intended"
     ts = _timestamp()
     base_output_dir = Path("eval_data/wcv2_one_prompt") / route_folder / ts
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    step_index = 0
+
+    print(f"Selected row-level metrics: {scoring_metrics if scoring_metrics is not None else 'all'}")
+    print(f"Selected Giskard scan metrics: {scan_metrics if scan_metrics else 'none'}")
+
+    if scan_metrics:
+        step_index += 1
+        print("\n" + "=" * 80)
+        print(f"STEP {step_index}/{total_steps}  giskard_scans  ->  {base_output_dir}")
+        print("=" * 80)
+        step_giskard_scans(
+            input_path=args.input,
+            output_dir=base_output_dir,
+            scan_metrics=scan_metrics,
+            n_samples=args.n_samples,
+            seed=args.seed,
+            n_adversarial_samples=args.n_adversarial_samples,
+            n_requirements=args.n_requirements,
+        )
+
+    if not should_run_scoring_pipeline:
+        print("\n" + "=" * 80)
+        print("FULL PIPELINE COMPLETE")
+        print("Completed Giskard scans only (no row-level scoring metrics selected).")
+        print(f"All outputs in: {base_output_dir}")
+        print("=" * 80)
+        return
 
     # ---- Step 1: eval pipeline ----
-    print("=" * 80)
-    print(f"STEP 1/5  eval_pipeline  ->  {base_output_dir}")
+    step_index += 1
+    print("\n" + "=" * 80)
+    print(f"STEP {step_index}/{total_steps}  eval_pipeline  ->  {base_output_dir}")
     print("=" * 80)
     step_eval_pipeline(
         input_path=args.input,
@@ -444,8 +574,8 @@ def main() -> None:
         route_column=args.route_column,
         routes=args.routes,
         run_name=args.run_name,
-        metrics=args.metrics,
-        limit=args.limit
+        metrics=scoring_metrics,
+        limit=args.limit,
     )
 
     # Discover enriched CSV produced by step 1
@@ -454,14 +584,15 @@ def main() -> None:
     print(f"\nEnriched CSV: {enriched_csv}")
 
     # ---- Step 2: split natural / synthetic ----
+    step_index += 1
     print("\n" + "=" * 80)
-    print(f"STEP 2/5  split_natural_synthetic  ->  {base_output_dir}")
+    print(f"STEP {step_index}/{total_steps}  split_natural_synthetic  ->  {base_output_dir}")
     print("=" * 80)
     split_output_dir = base_output_dir / "natural_synthetic_split"
     split_text, summaries = step_split_natural_synthetic(
         enriched_csv,
         split_output_dir,
-        metrics=args.metrics,
+        metrics=scoring_metrics,
     )
     print(split_text)
 
@@ -470,15 +601,16 @@ def main() -> None:
     print(f"Saved scores -> {scores_txt}")
 
     # ---- Step 3: heuristic scoring (all, natural, synthetic) ----
+    step_index += 1
     print("\n" + "=" * 80)
-    print("STEP 3/5  heuristic_scoring  (all / natural / synthetic)")
+    print(f"STEP {step_index}/{total_steps}  heuristic_scoring  (all / natural / synthetic)")
     print("=" * 80)
     heuristic_parts: list[str] = []
     heuristic_summaries: dict[str, dict] = {}
 
     # 3a — all data (uses *_results.csv from the base output dir, enriched also works)
     print("\n--- all data ---")
-    part, h_summary = step_heuristic_scoring(results_csv, metrics=args.metrics)
+    part, h_summary = step_heuristic_scoring(results_csv, metrics=scoring_metrics)
     print(part)
     heuristic_parts.append(f"=== ALL DATA ===\n{part}")
     heuristic_summaries["all"] = h_summary
@@ -486,7 +618,7 @@ def main() -> None:
     # 3b — natural
     natural_csv = _find_file_ending_with(split_output_dir, "_natural.csv")
     print("--- natural data ---")
-    part, h_summary = step_heuristic_scoring(natural_csv, metrics=args.metrics)
+    part, h_summary = step_heuristic_scoring(natural_csv, metrics=scoring_metrics)
     print(part)
     heuristic_parts.append(f"=== NATURAL DATA ===\n{part}")
     heuristic_summaries["natural"] = h_summary
@@ -494,7 +626,7 @@ def main() -> None:
     # 3c — synthetic
     synthetic_csv = _find_file_ending_with(split_output_dir, "_synthetic.csv")
     print("--- synthetic data ---")
-    part, h_summary = step_heuristic_scoring(synthetic_csv, metrics=args.metrics)
+    part, h_summary = step_heuristic_scoring(synthetic_csv, metrics=scoring_metrics)
     print(part)
     heuristic_parts.append(f"=== SYNTHETIC DATA ===\n{part}")
     heuristic_summaries["synthetic"] = h_summary
@@ -510,18 +642,20 @@ def main() -> None:
     print(f"Saved summary CSV -> {summary_csv_path}")
 
     # ---- Step 4: extract reasoning by score ----
+    step_index += 1
     print("\n" + "=" * 80)
-    print("STEP 4/5  extract_reasoning_by_score")
+    print(f"STEP {step_index}/{total_steps}  extract_reasoning_by_score")
     print("=" * 80)
     reasoning_dir = base_output_dir / "metrics_score_combinations"
-    step_extract_reasoning(enriched_csv, reasoning_dir, metrics=args.metrics)
+    step_extract_reasoning(enriched_csv, reasoning_dir, metrics=scoring_metrics)
 
     # ---- Step 5: summarize reasoning ----
+    step_index += 1
     print("\n" + "=" * 80)
-    print("STEP 5/5  summarize_reasoning")
+    print(f"STEP {step_index}/{total_steps}  summarize_reasoning")
     print("=" * 80)
     item_level_dir = reasoning_dir / "item_level"
-    step_summarize_reasoning(item_level_dir, metrics=args.metrics)
+    step_summarize_reasoning(item_level_dir, metrics=scoring_metrics)
 
     print("\n" + "=" * 80)
     print("FULL PIPELINE COMPLETE")
