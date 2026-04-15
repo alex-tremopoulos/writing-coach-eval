@@ -1,17 +1,22 @@
 # writing-coach-eval
 
-Evaluation workspace for Writing Coach V2. The repository is mainly built to prepare evaluation inputs, run the system in batch, normalize outputs into a reviewable dataset, and score those outputs with a dynamic rubrics pipeline.
+Evaluation workspace for Writing Coach V2. The repository prepares evaluation inputs, runs the system in batch, normalizes outputs into a reviewable dataset, and scores those outputs with a dynamic rubrics pipeline.
+
+The two main automation scripts are:
+
+- **`src/dataset_handling/data_pipeline.py`** — collect Writing Coach outputs across all datasets and consolidate them into a single `final_data/all_results.csv`.
+- **`src/run_full_eval.py`** — run the complete evaluation pipeline end-to-end against that consolidated file.
 
 ## What This Repository Covers
 
-The evaluation flow has four practical stages:
+The evaluation flow has four stages:
 
 1. Build or extend route-labeled evaluation data.
 2. Run Writing Coach V2 on each row and capture routing plus model outputs.
-3. Consolidate those outputs into a single evaluation dataset with intended-route labels and final returned text.
+3. Consolidate those outputs into a single evaluation dataset with intended-route labels.
 4. Score the results with a two-stage LLM evaluation pipeline.
 
-Writing Coach routes each example into one of four task types:
+Writing Coach routes each example into one of four task types: 
 
 | Route | Purpose |
 |---|---|
@@ -20,96 +25,15 @@ Writing Coach routes each example into one of four task types:
 | `RESPOND` | Answer, summarize, compare, or discuss based on given context |
 | `RESEARCH` | Search literature and return evidence-grounded findings |
 
-## Evaluation Pipeline
+## Setup
 
-The core evaluation logic lives in `src/evaluation/eval_pipeline.py`.
-
-It uses a two-stage asynchronous process:
-
-1. **Rubrics generation**: given a row's `query`, `input`, and intended `route`, the model generates task-specific rubric criteria.
-2. **Rubrics judging**: a second call scores the system output against those generated criteria.
-
-The pipeline is designed for batch work rather than one-off inspection:
-
-- Async concurrency with a semaphore limit
-- Incremental CSV and JSONL writing for resume support
-- Route filtering and row limits for targeted runs
-- Generator-only mode for inspecting rubric quality without running the judge
-- Enriched outputs that merge evaluation results back onto the original dataset rows
-
-The default evaluation input is `final_data/all_results_with_final_text.csv`, which contains the normalized system output text that should be judged.
-
-## Prompt Structure And Strategy
-
-Prompt assembly is handled by `src/evaluation/prompt_loader.py`.
-
-The evaluation prompts are intentionally split into two layers:
-
-- `src/prompts/rubrics_prompt.txt`: generates dynamic rubrics for the specific task instance
-- `src/prompts/rubrics_judge_prompt.txt`: scores the returned output against those rubrics
-
-Each prompt file uses a simple block structure:
-
-```text
-{% block system %}
-...
-{% endblock %}
-
-{% block prompt %}
-...
-{% endblock %}
-```
-
-That separation keeps the evaluation pipeline maintainable: stable evaluator behavior stays in the system block, while row-specific inputs are injected into the prompt block.
-
-The rubric-generation strategy combines four sources of context:
-
-- The user command
-- The original input text
-- Route-specific behavior guidance from `src/constants/route_prompts_v3.py`
-- Shared evaluation dimensions from `src/constants/metrics_definitions.py`
-
-Current metrics are deliberately narrow: the generated rubrics focus mainly on output relevancy and completeness. This keeps scoring aligned to the user request and route behavior rather than drifting into unrelated quality dimensions.
-
-The route-constraint hook exists in `src/constants/route_constraints.py`. It is currently minimal, but the structure is already in place for tightening route-specific rubric rules later.
-
-## Important Dataset Handling
-
-Most dataset work lives in `src/dataset_handling/`. The important pieces for evaluation are:
-
-- `merge_public_datasets.py`: builds the initial labeled base set from public sources
-- `synthesize_domain_data.py`: expands coverage with synthetic domain-adapted examples
-- `generate_eval_dataset.py`: creates the focused 21-row evaluation set used for Writing Coach examples
-- `reassign_data.py`: consolidates batch outputs from multiple route folders into a single `all_results` dataset and applies intended-route overrides where needed
-
-For evaluation, `reassign_data.py` matters because it turns scattered run outputs into a single table with:
-
-- A new global `row_id`
-- The original source folder and prior row id
-- `route_orch` and `route_intended`
-- A nested `output` payload with response data, suggestions, references, and tool usage
-- `dataset_source` mapping back to the original dataset when possible
-
-After consolidation, `src/build_final_text.py` computes `returned_final_text`. For `RESPOND` and `RESEARCH`, this is the response text directly. For revision routes, it applies all proposed suggestions to the original input so the evaluator scores the effective final text rather than the raw suggestion list.
-
-## Running The Flow
-
-### Setup
-
-Requirements:
-
-- Python 3.12
-- Azure OpenAI credentials for synthesis and evaluation
-
-Install dependencies:
+Requirements: Python 3.12 and Azure OpenAI credentials.
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
-
-Environment variables:
 
 ```env
 AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
@@ -118,57 +42,193 @@ AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT=<your-deployment-name>
 ```
 
-### 1. Run batch inference
+`WC_APP_SRC` must also be set (or passed via `--wc-app-src`) to point at the Writing Coach app root when running the data pipeline.
+
+---
+
+## Stage 1 — Collect Outputs: `data_pipeline.py`
+
+`src/dataset_handling/data_pipeline.py` automates collecting Writing Coach outputs across all configured datasets and producing the consolidated `final_data/all_results_MMDD.csv`.
 
 ```bash
-python -m src.store_output data/data_routes_expanded.csv
+python -m src.dataset_handling.data_pipeline
 ```
 
-This runs Writing Coach V2 over the dataset and stores routing decisions plus structured outputs.
+Key options:
 
-### 2. Consolidate outputs for evaluation
+| Argument | Default | Description |
+|---|---|---|
+| `--round-dir` | `data_outputs/round_DDMM` | Versioned output base for this run |
+| `--wc-app-src` | `$WC_APP_SRC` | Path to the Writing Coach app root |
+| `--jobs` | (see below) | JSON array of job objects to override the default list |
+| `--skip-store` | — | Skip store_output step and run only reassign |
+| `--skip-reassign` | — | Skip reassign step and run only store_output |
+
+### Default jobs
+
+The pipeline runs `store_output` once per job. `data_routes_expanded.csv` is run four times, once per route:
+
+| Input CSV | Output folder | Route filter |
+|---|---|---|
+| `data/data_routes_expanded.csv` | `research_only` | RESEARCH |
+| `data/data_routes_expanded.csv` | `respond_only` | RESPOND |
+| `data/data_routes_expanded.csv` | `revise_research_only` | REVISE_RESEARCH |
+| `data/data_routes_expanded.csv` | `revise_simple_only` | REVISE_SIMPLE |
+| `data/alex-9-extra-responds.csv` | `respond_only` | — |
+| `data/manu-10-extra-queries.csv` | `extra10` | — |
+| `data/manual_edge_cases_cor.csv` | `cor_edge_cases` | — |
+| `data/wc2_eval_21.csv` | `new21` | — |
+| `data/data_routes_kiwi_selected167.csv` | `extra167kiwi` | — |
+
+Pass `--jobs` as a JSON array to override with custom datasets:
 
 ```bash
-python src/dataset_handling/reassign_data.py
-python src/build_final_text.py
+python -m src.dataset_handling.data_pipeline \
+  --jobs '[{"csv":"data/my.csv","folder":"my_folder","route":"RESEARCH"}]'
 ```
 
-This produces:
+### Scripts called internally
 
-- `final_data/all_results.csv`
-- `final_data/all_results.jsonl`
-- `final_data/all_results_with_final_text.csv`
-- `final_data/all_results_with_final_text.jsonl`
+#### `src/scripts/store_output.py`
 
-### 3. Run the evaluation pipeline
+Runs Writing Coach V2 on each row of an input CSV and writes results incrementally. The input CSV must have `query`, `input`, and optionally `route` columns. Supports resume via incremental writes.
+
+Can also be run standalone for a single dataset:
 
 ```bash
-python -m src.evaluation.eval_pipeline --input final_data/all_results_with_final_text.csv
+python -m src.scripts.store_output data/my_data.csv \
+  --results-csv data_outputs/round_custom/myfolder/results.csv \
+  --details-jsonl data_outputs/round_custom/myfolder/details.jsonl \
+  --route RESPOND
 ```
 
-Useful options:
+The `--route` argument limits processing to rows matching that route value.
 
-- `--routes RESEARCH RESPOND`
-- `--limit 10`
-- `--concurrency 3`
-- `--generator-only`
+#### `src/dataset_handling/reassign_data_v2.py`
 
-Evaluation outputs are written to `data_outputs/eval/` as:
+Consolidates per-folder JSONL outputs into a single `final_data/all_results_MMDD.csv`. This is the current recommended consolidation script.
 
-- `*_results.csv`: per-row summary scores and packed JSON fields
-- `*_details.jsonl`: full generator and judge outputs
-- `*_all_results_enriched.csv`
-- `*_all_results_enriched.jsonl`
+It loads **intended routes from the existing `final_data/all_results.csv` as a gold standard** rather than re-deriving them from orchestrator decisions or hardcoded overrides. This means:
+
+- `route_intended` from a previous reviewed run is preserved automatically.
+- No manual overrides need to be re-applied when re-running for a new WC version.
+- A first-time run (or a new dataset) still requires a manual review pass to confirm which orchestrator route should be treated as intended.
+
+The older `reassign_data.py` uses hardcoded per-row exceptions and is kept for reference only.
+
+**Outputs:** `final_data/all_results_MMDD.csv` and `final_data/all_results_MMDD.jsonl`, each row carrying a global `row_id`, `route_orch`, `route_intended`, nested `output` payload, and `dataset_source`.
+
+---
+
+## Stage 2 — Run Evaluation: `run_full_eval.py`
+
+`src/run_full_eval.py` orchestrates the full evaluation pipeline end-to-end in five sequential steps.
+
+```bash
+python -m src.run_full_eval
+```
+
+Key options:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--input` | `final_data/all_results.csv` | Input CSV with system outputs |
+| `--route-column` | `intended` | `intended` or `orchestrator` |
+| `--routes` | (all) | Restrict to specific routes, e.g. `RESEARCH RESPOND` |
+| `--metrics` | (all) | Restrict to specific metrics: `completeness output_relevancy correctness` |
+| `--run-name` | `eval_YYYYMMDD_HHMMSS` | Namespace for output files |
+| `--limit` | — | Max rows to process (useful for testing) |
+
+### Output location
+
+All outputs land under:
+
+```
+eval_data/wcv2_one_prompt/{route_intended|route_orch}/{timestamp}/
+```
+
+Key files produced:
+
+| File | Contents |
+|---|---|
+| `*_results.csv` | Per-row scores and packed JSON fields |
+| `*_details.jsonl` | Full generator and judge records |
+| `*_all_results_enriched.csv/jsonl` | Eval columns merged back onto original rows |
+| `scores_all_natural_synthetic.txt` | Printed score summary for all / natural / synthetic splits |
+| `heuristic_scoring_all_natural_synthetic.txt` | Heuristic scoring summary |
+| `summary_scores.csv` | Flat summary keyed by `data_origin` × `scope` × `route` |
+| `metrics_score_combinations/item_level/reasoning_summaries.json` | LLM-generated pattern summaries per metric and score |
+
+### Steps and scripts called internally
+
+#### Step 1 — `src/evaluation/eval_pipeline.py`
+
+Two-stage async LLM evaluation:
+
+1. **Rubrics generation** — given `query`, `input`, and `route`, generates task-specific rubric criteria.
+2. **Rubrics judging** — scores the system output against those rubrics.
+
+Runs with a semaphore-limited concurrency, writes incrementally to CSV + JSONL for resume support. Produces the enriched CSV consumed by all downstream steps.
+
+Can be run standalone:
+
+```bash
+python -m src.evaluation.eval_pipeline \
+  --input final_data/all_results.csv \
+  --routes RESEARCH RESPOND \
+  --concurrency 3 \
+  --limit 10
+```
+
+#### Step 2 — `src/scripts/split_natural_synthetic.py`
+
+Splits the enriched results into natural and synthetic subsets and recomputes micro/macro score aggregations per route. Can be run standalone against any enriched CSV.
+
+#### Step 3 — `src/scripts/heuristic_scoring.py`
+
+Reconstructs metric-level scores from per-item verdicts using fixed importance weights (low=1, medium=2, high=3). Runs against all, natural, and synthetic subsets. Produces `*_heuristic.csv` files with augmented score columns.
+
+#### Step 4 — `src/evaluation/extract_reasoning_by_score.py`
+
+Extracts reasoning text from the enriched CSV, grouped by metric and score value (0, 1, 2), into item-level JSON files under `metrics_score_combinations/item_level/`.
+
+#### Step 5 — `src/evaluation/summarize_reasoning.py`
+
+Sends the per-metric, per-score reasoning JSONs to an LLM, which summarizes recurring patterns as strengths and weaknesses. Writes `reasoning_summaries.json`.
+
+All five scripts can also be run independently if a partial re-run is needed.
+
+---
+
+## Prompts
+
+Evaluation prompts live in `src/prompts/` and are loaded by `src/evaluation/prompt_loader.py`. Each file uses `{% block system %}` / `{% block prompt %}` blocks — the system block holds stable evaluator behavior, and the prompt block receives row-specific inputs at runtime.
+
+- `rubrics_prompt.txt` — generates dynamic rubrics from the query, input, and route context
+- `rubrics_judge_prompt.txt` — scores the system output against those rubrics
+
+Route-specific guidance is supplied from `src/constants/route_prompts.py` and shared metric definitions from `src/constants/metrics_definitions.py`.
+
+---
 
 ## Repository Pointers
 
-- `src/store_output.py`: batch inference runner for Writing Coach V2
-- `src/dataset_handling/`: dataset construction and consolidation scripts
-- `src/build_final_text.py`: derives final text for evaluation
-- `src/evaluation/eval_pipeline.py`: async rubrics evaluation pipeline
-- `src/evaluation/prompt_loader.py`: prompt parsing and slot injection
-- `src/prompts/`: evaluation prompt templates
-- `src/constants/`: route prompts, route constraints, and metric definitions
+| Path | Purpose |
+|---|---|
+| `src/dataset_handling/data_pipeline.py` | End-to-end data collection pipeline |
+| `src/run_full_eval.py` | End-to-end evaluation pipeline |
+| `src/scripts/store_output.py` | Batch WC V2 inference runner |
+| `src/dataset_handling/reassign_data_v2.py` | Consolidates JSONL outputs using gold-standard routes |
+| `src/dataset_handling/reassign_data.py` | Legacy consolidation script with hardcoded overrides |
+| `src/evaluation/eval_pipeline.py` | Async rubrics evaluation pipeline |
+| `src/evaluation/prompt_loader.py` | Prompt parsing and slot injection |
+| `src/scripts/split_natural_synthetic.py` | Splits enriched results by data origin |
+| `src/scripts/heuristic_scoring.py` | Heuristic scoring from verdict weights |
+| `src/evaluation/extract_reasoning_by_score.py` | Extracts reasoning by metric and score |
+| `src/evaluation/summarize_reasoning.py` | LLM summarization of reasoning patterns |
+| `src/prompts/` | Evaluation prompt templates |
+| `src/constants/` | Route prompts, constraints, and metric definitions |
+| `src/dataset_handling/` | Dataset construction and consolidation scripts |
 
 ## Dependencies
 
