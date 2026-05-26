@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -117,6 +118,20 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of generated requirements per Giskard detector (default: 4)",
     )
+    parser.add_argument(
+        "--wc-version",
+        choices=["v2", "v3"],
+        default="v3",
+        help="Writing Coach interface version used by Giskard scans (default: v3)",
+    )
+    parser.add_argument(
+        "--wc-app-src",
+        default=(os.getenv("WC_APP_SRC") or "").strip('"').strip("'") or None,
+        help=(
+            "Path to Writing Coach app root or src directory for Giskard scans "
+            "(optional if WC_APP_SRC is set)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -149,6 +164,8 @@ def main() -> None:
             seed=args.seed,
             n_adversarial_samples=args.n_adversarial_samples,
             n_requirements=args.n_requirements,
+            wc_version=args.wc_version,
+            wc_app_src=args.wc_app_src,
         )
 
     if not should_run_scoring_pipeline:

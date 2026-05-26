@@ -3,7 +3,7 @@ data_pipeline.py
 
 End-to-end evaluation data pipeline:
 
-  1. Runs store_output_wc_v3.py for each configured input job, writing JSONL outputs
+  1. Runs store_output.py (--version v3) for each configured input job, writing JSONL outputs
      into subfolders of a versioned round directory (data_outputs/round_DDMM).
 
   2. Runs reassign_data_v2.py against that round directory to produce the
@@ -103,7 +103,7 @@ def _run(cmd: list[str], label: str, extra_env: dict[str, str] | None = None) ->
 # ---------------------------------------------------------------------------
 
 def run_store_output(jobs: list[dict], round_dir: Path, wc_app_src: str | None) -> None:
-    """Run store_output_wc_v3.py once per job, placing outputs in round_dir/<folder>/."""
+    """Run store_output.py once per job, placing outputs in round_dir/<folder>/."""
     extra_env = {"WC_APP_SRC": wc_app_src} if wc_app_src else None
 
     for job in jobs:
@@ -117,10 +117,11 @@ def run_store_output(jobs: list[dict], round_dir: Path, wc_app_src: str | None) 
             label_parts.append(f"(route={route})")
         label = " ".join(label_parts)
 
-        store_script = ROOT / "src" / "scripts" / "store_output_wc_v3.py"
+        store_script = ROOT / "src" / "scripts" / "store_output.py"
         cmd = [
             sys.executable, str(store_script),
             str(csv_path),
+            "--version", "v3",
             "--output", str(output_subdir),
         ]
         if route:

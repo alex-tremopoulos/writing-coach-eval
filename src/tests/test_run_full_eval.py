@@ -53,6 +53,8 @@ class TestGiskardScanStep(unittest.TestCase):
                     seed=11,
                     n_adversarial_samples=3,
                     n_requirements=2,
+                    wc_version="v2",
+                    wc_app_src="/tmp/external-wc",
                 )
 
         self.assertEqual([name for name, _ in calls], ["potential_harm", "toxicity"])
@@ -64,6 +66,8 @@ class TestGiskardScanStep(unittest.TestCase):
         self.assertTrue(all(kwargs["seed"] == 11 for _, kwargs in calls))
         self.assertTrue(all(kwargs["n_adversarial_samples"] == 3 for _, kwargs in calls))
         self.assertTrue(all(kwargs["n_requirements"] == 2 for _, kwargs in calls))
+        self.assertTrue(all(kwargs["wc_version"] == "v2" for _, kwargs in calls))
+        self.assertTrue(all(kwargs["wc_app_src"] == "/tmp/external-wc" for _, kwargs in calls))
 
 
 if __name__ == "__main__":

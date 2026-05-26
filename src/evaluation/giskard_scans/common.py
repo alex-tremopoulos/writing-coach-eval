@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +17,8 @@ from giskard import Dataset, Model, scan
 from giskard.core.core import SupportedModelTypes
 from giskard.scanner.registry import DetectorRegistry
 from giskard.scanner.report import ScanReport
+from src.scripts.writing_coach_interfaces import create_writing_coach
+from src.scripts.writing_coach_interfaces.utils import install_wc_app_path
 
 load_dotenv()
 
@@ -36,71 +37,35 @@ for noisy in ("langsmith", "langchain", "httpx", "httpcore", "openai"):
 
 _DEFAULT_DATASET_CSV = Path(__file__).parents[3] / "final_data" / "all_results.csv"
 
-_wc_graph = None
-_wc_preset_config = None
+_wc_coach = None
+_wc_version: str | None = None
 
 
 def _get_wc_app_src() -> Optional[str]:
 	return os.getenv("WC_APP_SRC")
 
 
-def _ensure_wc_path_on_syspath() -> str:
-	wc_app_src = _get_wc_app_src()
-	if not wc_app_src:
+def _resolve_wc_app_src(wc_app_src: Optional[str]) -> str:
+	resolved = wc_app_src or _get_wc_app_src()
+	if not resolved:
 		raise RuntimeError(
-			"WC_APP_SRC not set. Set WC_APP_SRC to the root of the Writing Coach app codebase."
+			"WC_APP_SRC not set. Set WC_APP_SRC or pass --wc-app-src to the pipeline."
 		)
-
-	wc_root = str(Path(wc_app_src).resolve())
-	if wc_root not in sys.path:
-		sys.path.insert(0, wc_root)
-		logger.info("Writing Coach app root added to sys.path: %s", wc_root)
-	return wc_root
+	return resolved
 
 
-def _load_wc_dependencies():
-	# Imports are intentionally lazy so importing this module does not require WC app code.
-	from langgraph.graph import END, START  # type: ignore[import]
-	from src.graph_builder import GraphBuilder  # type: ignore[import]
-	from src.graph_nodes.writing_coach_nodes import (  # type: ignore[import]
-		output_node,
-		research_response_node,
-		research_transform_node,
-		revision_explanation_node,
-		search_node,
-		search_router,
-		segment_analysis_node,
-		segment_analysis_router,
-		simple_transform_node,
-		wc_orchestrator_node,
-		wc_orchestrator_router,
-		wc_respond_node,
-	)
-	from src.graph_presets import get_preset, register_preset  # type: ignore[import]
-	from src.presets_config import get_preset_config  # type: ignore[import]
-	from src.state_definitions import WritingCoachV2State  # type: ignore[import]
+def init_wc_interface(version: str = "v3", wc_app_src: Optional[str] = None) -> None:
+	"""Initialize Writing Coach interface once and cache it."""
+	global _wc_coach, _wc_version  # noqa: PLW0603
 
-	return {
-		"START": START,
-		"END": END,
-		"GraphBuilder": GraphBuilder,
-		"WritingCoachV2State": WritingCoachV2State,
-		"get_preset": get_preset,
-		"register_preset": register_preset,
-		"get_preset_config": get_preset_config,
-		"wc_orchestrator_node": wc_orchestrator_node,
-		"wc_orchestrator_router": wc_orchestrator_router,
-		"segment_analysis_node": segment_analysis_node,
-		"segment_analysis_router": segment_analysis_router,
-		"search_node": search_node,
-		"search_router": search_router,
-		"research_response_node": research_response_node,
-		"research_transform_node": research_transform_node,
-		"simple_transform_node": simple_transform_node,
-		"revision_explanation_node": revision_explanation_node,
-		"wc_respond_node": wc_respond_node,
-		"output_node": output_node,
-	}
+	if _wc_coach is not None and _wc_version == version:
+		return
+
+	resolved_wc_app_src = _resolve_wc_app_src(wc_app_src)
+	install_wc_app_path(resolved_wc_app_src)
+	logger.info("Initializing Writing Coach interface '%s' from %s", version, resolved_wc_app_src)
+	_wc_coach = create_writing_coach(version)
+	_wc_version = version
 
 
 def load_sample_documents(
@@ -134,98 +99,32 @@ def load_sample_documents(
 
 def writing_coach_predict(df) -> list[str]:
 	"""Prediction function consumed by giskard.Model."""
-	if not _get_wc_app_src():
+	if _wc_coach is None:
 		raise RuntimeError(
-			"WC_APP_SRC not set. Set WC_APP_SRC to the root of the Writing Coach app codebase."
+			"Writing Coach interface is not initialized. Call run_scan_for_detector first."
 		)
 	return _writing_coach_predict_real(df)
 
 
-def init_wc_graph() -> None:
-	"""Initialize Writing Coach graph once and cache it."""
-	global _wc_graph, _wc_preset_config  # noqa: PLW0603
-
-	if _wc_graph is not None:
-		return
-
-	wc_root = _ensure_wc_path_on_syspath()
-	deps = _load_wc_dependencies()
-
-	logger.info("Initializing Writing Coach V2 graph from %s", wc_root)
-
-	builder = deps["GraphBuilder"](deps["WritingCoachV2State"])
-	builder.set_display_name("Writing Coach V2")
-	builder.set_description("Conversational writing coach with hybrid graph architecture")
-
-	for name, fn in [
-		("wc2/orchestrator", deps["wc_orchestrator_node"]),
-		("wc2/segment_analysis", deps["segment_analysis_node"]),
-		("wc2/copilot_search", deps["search_node"]),
-		("wc2/research_response", deps["research_response_node"]),
-		("wc2/research_transform", deps["research_transform_node"]),
-		("wc2/simple_transform", deps["simple_transform_node"]),
-		("wc2/revision_explanation", deps["revision_explanation_node"]),
-		("wc2/respond", deps["wc_respond_node"]),
-		("wc2/output", deps["output_node"]),
-	]:
-		builder.register_node_function(name, fn)
-		builder.add_node(name)
-
-	builder.add_edge(deps["START"], "wc2/orchestrator")
-	builder.add_conditional_edge("wc2/orchestrator", deps["wc_orchestrator_router"], {
-		"wc2/segment_analysis": "wc2/segment_analysis",
-		"wc2/respond": "wc2/respond",
-	})
-	builder.add_conditional_edge("wc2/segment_analysis", deps["segment_analysis_router"], {
-		"wc2/copilot_search": "wc2/copilot_search",
-		"wc2/simple_transform": "wc2/simple_transform",
-		"wc2/revision_explanation": "wc2/revision_explanation",
-		"wc2/respond": "wc2/respond",
-	})
-	builder.add_conditional_edge("wc2/copilot_search", deps["search_router"], {
-		"wc2/research_response": "wc2/research_response",
-		"wc2/research_transform": "wc2/research_transform",
-	})
-	builder.add_edge("wc2/research_response", "wc2/output")
-	builder.add_edge("wc2/research_transform", "wc2/revision_explanation")
-	builder.add_edge("wc2/simple_transform", "wc2/revision_explanation")
-	builder.add_edge("wc2/revision_explanation", "wc2/output")
-	builder.add_edge("wc2/respond", "wc2/output")
-	builder.add_edge("wc2/output", deps["END"])
-
-	deps["register_preset"]("writing_coach_v2", builder)
-	_wc_graph = deps["get_preset"]("writing_coach_v2").build_without_checkpointing()
-	_wc_preset_config = deps["get_preset_config"]("writing_coach_v2")
-	logger.info("Writing Coach V2 graph ready")
-
-
 def _writing_coach_predict_real(df) -> list[str]:
+	if _wc_coach is None:
+		raise RuntimeError("Writing Coach interface has not been initialized")
+
 	responses: list[str] = []
 
 	for idx, (_, row) in enumerate(df.iterrows()):
-		initial_state = {
-			"message": row["user_command"],
-			"document_text": row["document"],
-			"selected_text": None,
-			"conversation_history": [],
-			"prior_references": [],
-			"conversation_id": f"giskard_scan_{idx}",
-			"conversation_turn": 1,
-			"streaming": False,
-			"writer": None,
-			"preset": "writing_coach_v2",
-			"model_config": _wc_preset_config.get("models", {}),
-			"prompt_versions": _wc_preset_config.get("prompts", {}),
-			"parameters": _wc_preset_config.get("parameters", {}),
-			"suggestions": [],
-			"references": [],
-			"research_papers": [],
-		}
 		try:
-			final_state = _wc_graph.invoke(initial_state)
-			responses.append(build_response(final_state))
+			result = _wc_coach.run_query(
+				row_id=idx,
+				query=row["user_command"],
+				document_text=row["document"],
+			)
+			responses.append(build_response(result))
 		except openai.BadRequestError as exc:
 			responses.append(json.dumps(exc.body))
+		except Exception as exc:  # noqa: BLE001
+			logger.exception("Writing Coach prediction failed for scan row %s", idx)
+			responses.append(json.dumps({"error": str(exc)}))
 
 	return responses
 
@@ -313,6 +212,8 @@ def run_scan_for_detector(
     seed: Optional[int] = None,
     n_adversarial_samples: Optional[int] = None,
     n_requirements: Optional[int] = None,
+	wc_version: str = "v3",
+	wc_app_src: Optional[str] = None,
     model_type: SupportedModelTypes = "text_generation",
     persist_output: bool = False,
     output_dir: Optional[str] = None,
@@ -325,7 +226,9 @@ def run_scan_for_detector(
         n_samples: Number of samples to use from dataset.
         seed: Random seed for sampling.
         n_adversarial_samples: Number of adversarial samples per detector.
-        n_requirements: Number of requirements per detector.
+		n_requirements: Number of requirements per detector.
+		wc_version: Writing Coach interface version to use (v2 or v3).
+		wc_app_src: Optional path to external Writing Coach repo root or src dir.
         model_type: Giskard model type.
         persist_output: Whether to save results to disk.
         output_dir: Directory to save results (required if persist_output=True).
@@ -345,8 +248,8 @@ def run_scan_for_detector(
     )
     gsk_dataset = build_giskard_dataset(sample_docs)
 
-    logger.info("Initializing Writing Coach graph")
-    init_wc_graph()
+    logger.info("Initializing Writing Coach interface")
+    init_wc_interface(version=wc_version, wc_app_src=wc_app_src)
 
     logger.info("Running detector: %s", detector)
     detector_params = build_detector_params(detector, n_adversarial_samples, n_requirements)
@@ -532,12 +435,14 @@ def print_summary(
 	print("=" * 64 + "\n")
 
 
-def validate_required_env_vars() -> None:
+def validate_required_env_vars(wc_app_src: Optional[str] = None) -> None:
 	missing = [
 		name
-		for name in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "WC_APP_SRC")
+		for name in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY")
 		if not os.getenv(name)
 	]
+	if not (wc_app_src or os.getenv("WC_APP_SRC")):
+		missing.append("WC_APP_SRC")
 	if missing:
 		raise EnvironmentError(
 			"Missing required environment variables: " + ", ".join(missing)

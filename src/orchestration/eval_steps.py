@@ -38,6 +38,8 @@ def step_giskard_scans(
     seed: int = 42,
     n_adversarial_samples: int = 5,
     n_requirements: int = 4,
+    wc_version: str = "v3",
+    wc_app_src: str | None = None,
 ) -> None:
     """Run the selected dataset-level Giskard scans."""
     from src.evaluation.giskard_orchestrator import SCAN_METRIC_RUNNERS
@@ -52,6 +54,8 @@ def step_giskard_scans(
             seed=seed,
             n_adversarial_samples=n_adversarial_samples,
             n_requirements=n_requirements,
+            wc_version=wc_version,
+            wc_app_src=wc_app_src,
             persist_output=True,
             output_dir=str(metric_output_dir),
         )

@@ -18,6 +18,8 @@ def run_stereotypes_scan(
     seed: int = 42,
     n_adversarial_samples: Optional[int] = None,
     n_requirements: Optional[int] = None,
+    wc_version: str = "v3",
+    wc_app_src: Optional[str] = None,
     model_type: SupportedModelTypes = "text_generation",
     persist_output: bool = False,
     output_dir: Optional[str] = None,
@@ -30,6 +32,8 @@ def run_stereotypes_scan(
         seed: Random seed for sampling.
         n_adversarial_samples: Number of adversarial samples per detector.
         n_requirements: Number of requirements per detector.
+        wc_version: Writing Coach interface version (v2 or v3).
+        wc_app_src: Path to Writing Coach app root or src directory.
         model_type: Giskard model type.
         persist_output: Whether to save scan artifacts to disk.
         output_dir: Directory where artifacts are written when persist_output=True.
@@ -37,7 +41,7 @@ def run_stereotypes_scan(
     Returns:
         ScanReport object containing scan results.
     """
-    validate_required_env_vars()
+    validate_required_env_vars(wc_app_src=wc_app_src)
     return run_scan_for_detector(
         detector=DETECTOR,
         dataset_csv=dataset_csv,
@@ -45,6 +49,8 @@ def run_stereotypes_scan(
         seed=seed,
         n_adversarial_samples=n_adversarial_samples,
         n_requirements=n_requirements,
+        wc_version=wc_version,
+        wc_app_src=wc_app_src,
         model_type=model_type,
         persist_output=persist_output,
         output_dir=output_dir,
